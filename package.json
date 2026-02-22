@@ -7,15 +7,19 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "self-test": "python3 -m python.self_test"
+    "self-test": "uv run pytest tests/ -x",
+    "prepare": "husky"
   },
   "openclaw": {
-    "extensions": ["./dist/index.js"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "peerDependencies": {
     "openclaw": "*"
   },
   "devDependencies": {
+    "husky": "^9.1.7",
     "typescript": "^5.4.0"
   },
   "files": [

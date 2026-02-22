@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections import deque
 import copy
 import json
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 try:
@@ -22,13 +22,14 @@ try:
     from .statistics import RollingStatistics
     from .tcp_server import TcpBroadcastServer, TcpControlServer, TcpTelemetryServer
 except ImportError:
+    from statistics import RollingStatistics  # type: ignore[no-rebase]
+
     from ring_buffer import (  # type: ignore[no-rebase]
         DEFAULT_BUFFER_SIZE,
         DEFAULT_FRAME_DELIMITER,
         DEFAULT_MAX_FRAMES,
         RingBuffer,
     )
-    from statistics import RollingStatistics  # type: ignore[no-rebase]
     from tcp_server import (  # type: ignore[no-rebase]
         TcpBroadcastServer,
         TcpControlServer,
@@ -354,7 +355,9 @@ class SerialAdapter:
 
     def poll(self) -> Optional[Dict[str, Any]]:
         """Non-blocking read of one structured frame."""
-        reader_alive = self._reader_thread is not None and self._reader_thread.is_alive()
+        reader_alive = (
+            self._reader_thread is not None and self._reader_thread.is_alive()
+        )
         if not reader_alive:
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
@@ -367,7 +370,9 @@ class SerialAdapter:
 
     def poll_all(self) -> List[Dict[str, Any]]:
         """Return all currently available structured frames."""
-        reader_alive = self._reader_thread is not None and self._reader_thread.is_alive()
+        reader_alive = (
+            self._reader_thread is not None and self._reader_thread.is_alive()
+        )
         if not reader_alive:
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
@@ -386,12 +391,15 @@ class SerialAdapter:
         if not isinstance(data, dict):
             raise TypeError("data must be a dict")
 
-        payload = json.dumps(
-            data,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8") + self._ring_buffer.frame_delimiter
+        payload = (
+            json.dumps(
+                data,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+            + self._ring_buffer.frame_delimiter
+        )
 
         with self._serial_lock:
             if self._serial is None:
@@ -428,7 +436,9 @@ class SerialAdapter:
         now = time.monotonic()
         window_start = now - 1.0
         with self._control_lock:
-            while self._control_timestamps and self._control_timestamps[0] < window_start:
+            while (
+                self._control_timestamps and self._control_timestamps[0] < window_start
+            ):
                 self._control_timestamps.popleft()
             if len(self._control_timestamps) >= self._max_control_rate:
                 return False
@@ -457,7 +467,9 @@ class SerialAdapter:
         while queue and queue[0] < cutoff:
             queue.popleft()
 
-    def _handle_telemetry_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _handle_telemetry_request(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
         if payload.get("cmd") != "status":
             return None
         return self.get_status()

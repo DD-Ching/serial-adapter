@@ -4,6 +4,7 @@
 Launched by the TypeScript plugin via ``python3 -m python``.
 Outputs a single JSON ready line to stdout, then blocks until SIGTERM/SIGINT.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,7 +24,17 @@ def main() -> None:
     parser.add_argument("--telemetry-port", type=int, default=9000)
     parser.add_argument("--control-port", type=int, default=9001)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run pytest test suite and exit",
+    )
     args = parser.parse_args()
+
+    if args.self_test:
+        import subprocess
+
+        raise SystemExit(subprocess.call(["uv", "run", "pytest", "tests/", "-x"]))
 
     adapter = SerialAdapter(
         port=args.port,

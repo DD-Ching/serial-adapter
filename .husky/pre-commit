@@ -1,0 +1,4 @@
+npx tsc --noEmit
+uv run ruff check python/
+uv run ruff format --check python/
+uv run pytest tests/ -x

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections import deque
 import json
 import select
 import socket
 import threading
+from collections import deque
 from typing import Any, Callable, Deque, Dict, Optional
 
 
@@ -31,7 +31,9 @@ class _TcpJsonServerCore:
         broadcast_enabled: bool,
         command_enabled: bool,
         command_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
-        request_handler: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        request_handler: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         self._host = host
         self._port = int(port)
@@ -120,12 +122,15 @@ class _TcpJsonServerCore:
         if not self._broadcast_enabled:
             return
 
-        payload = json.dumps(
-            frame,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8") + self._frame_delimiter
+        payload = (
+            json.dumps(
+                frame,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+            + self._frame_delimiter
+        )
 
         with self._queue_lock:
             self._broadcast_queue.append(payload)
@@ -260,13 +265,18 @@ class _TcpJsonServerCore:
             # Control input path is best-effort.
             return
 
-    def _enqueue_client_payload(self, client: socket.socket, payload: Dict[str, Any]) -> None:
-        data = json.dumps(
-            payload,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8") + self._frame_delimiter
+    def _enqueue_client_payload(
+        self, client: socket.socket, payload: Dict[str, Any]
+    ) -> None:
+        data = (
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+            + self._frame_delimiter
+        )
         with self._clients_lock:
             queue = self._outgoing.get(client)
             if queue is None:
@@ -341,7 +351,9 @@ class TcpTelemetryServer(_TcpJsonServerCore):
         port: int = 9000,
         *,
         frame_delimiter: bytes | str = b"\n",
-        request_handler: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        request_handler: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         super().__init__(
             host=host,
@@ -386,7 +398,9 @@ class TcpBroadcastServer(_TcpJsonServerCore):
         *,
         frame_delimiter: bytes | str = b"\n",
         command_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
-        request_handler: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        request_handler: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         super().__init__(
             host=host,

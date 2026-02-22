@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import deque
 import threading
+from collections import deque
 from typing import Deque, List, Optional
 
 DEFAULT_BUFFER_SIZE = 512 * 1024
