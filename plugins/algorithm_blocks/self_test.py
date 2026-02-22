@@ -1,15 +1,23 @@
 ﻿from __future__ import annotations
 
-import math
+import threading
 import time
 from typing import Any
 
 import numpy as np
 
 try:
+    from plugins.algorithm_blocks.base import AlgorithmBlock
     from plugins.algorithm_blocks.fft_block import FFTBlock
     from plugins.algorithm_blocks.kalman_block import KalmanBlock
-    from plugins.algorithm_blocks.llm_api import add_block, create_pipeline, process_frame, remove_block
+    from plugins.algorithm_blocks.llm_api import (
+        add_block,
+        create_pipeline,
+        list_supported_blocks,
+        process_frame,
+        register_block_type,
+        remove_block,
+    )
     from plugins.algorithm_blocks.moving_average_block import MovingAverageBlock
     from plugins.algorithm_blocks.pid_block import PIDBlock
     from plugins.algorithm_blocks.pipeline import AlgorithmPipeline
@@ -18,9 +26,17 @@ except ImportError:
     import sys
 
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+    from plugins.algorithm_blocks.base import AlgorithmBlock
     from plugins.algorithm_blocks.fft_block import FFTBlock
     from plugins.algorithm_blocks.kalman_block import KalmanBlock
-    from plugins.algorithm_blocks.llm_api import add_block, create_pipeline, process_frame, remove_block
+    from plugins.algorithm_blocks.llm_api import (
+        add_block,
+        create_pipeline,
+        list_supported_blocks,
+        process_frame,
+        register_block_type,
+        remove_block,
+    )
     from plugins.algorithm_blocks.moving_average_block import MovingAverageBlock
     from plugins.algorithm_blocks.pid_block import PIDBlock
     from plugins.algorithm_blocks.pipeline import AlgorithmPipeline
@@ -36,12 +52,57 @@ def _assert_close(actual: float, expected: float, tol: float, message: str) -> N
         raise RuntimeError(f"{message}. actual={actual}, expected={expected}, tol={tol}")
 
 
+class _ScaleBlock(AlgorithmBlock):
+    def __init__(self, config: dict[str, Any] | None = None, *, name: str | None = None) -> None:
+        super().__init__(name=name or "scale")
+        self._factor = 1.0
+        self.initialize(config or {})
+
+    def initialize(self, config: dict[str, Any]) -> None:
+        self._factor = float(config.get("factor", 1.0))
+
+    def process(self, frame: dict[str, Any]) -> dict[str, Any]:
+        out = self.copy_frame(frame)
+        value = self.extract_numeric(frame, "value")
+        if value is None:
+            self.mark_not_ready(out, self.name, "missing_numeric_input")
+            return out
+        out["scaled"] = value * self._factor
+        self.set_algorithm_output(out, self.name, {"ready": True, "scaled": out["scaled"]})
+        return out
+
+    def reset(self) -> None:
+        return
+
+    def get_state(self) -> dict[str, Any]:
+        return {"name": self.name, "factor": self._factor}
+
+
+class _FailingBlock(AlgorithmBlock):
+    def __init__(self, config: dict[str, Any] | None = None, *, name: str | None = None) -> None:
+        super().__init__(name=name or "failing")
+        self.initialize(config or {})
+
+    def initialize(self, config: dict[str, Any]) -> None:
+        return
+
+    def process(self, frame: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("intentional failure")
+
+    def reset(self) -> None:
+        return
+
+    def get_state(self) -> dict[str, Any]:
+        return {"name": self.name}
+
+
 def test_fft_block() -> None:
     block = FFTBlock(
         config={
             "input_key": "value",
             "window_size": 32,
             "sample_rate_hz": 32.0,
+            "window_type": "hamming",
         },
         name="fft",
     )
@@ -69,13 +130,15 @@ def test_pid_block() -> None:
             "kp": 2.0,
             "ki": 0.5,
             "kd": 0.0,
+            "output_min": -100.0,
+            "output_max": 100.0,
         },
         name="pid",
     )
 
-    source = {"measurement": 7.0, "timestamp": 1.0}
+    source = {"measurement": 7.0, "timestamp": 1.0, "algorithms": {"existing": {"ok": True}}}
     out1 = pid.process(source)
-    _assert(source == {"measurement": 7.0, "timestamp": 1.0}, "PID block modified input frame in-place")
+    _assert(source["algorithms"] == {"existing": {"ok": True}}, "PID block modified input nested data")
     _assert_close(float(out1["command"]), 6.0, 1e-6, "PID first output mismatch")
 
     out2 = pid.process({"measurement": 8.0, "timestamp": 2.0})
@@ -120,10 +183,11 @@ def test_pipeline_chain() -> None:
 
     final = pipeline.process({"value": 1.0, "timestamp": 1.0})
     final = pipeline.process({"value": 2.0, "timestamp": 2.0})
-    original = {"value": 3.0, "timestamp": 3.0}
+    original = {"value": 3.0, "timestamp": 3.0, "algorithms": {"legacy": {"flag": 1}}}
     final = pipeline.process(original)
 
     _assert(final is not original, "Pipeline must return a new frame instance")
+    _assert(original["algorithms"] == {"legacy": {"flag": 1}}, "Pipeline mutated input nested algorithm data")
     _assert("value_ma" in final and "control" in final and "control_kalman" in final, "Pipeline outputs missing")
     _assert_close(float(final["value_ma"]), 2.0, 1e-6, "Moving average output mismatch")
     _assert_close(float(final["control"]), 3.0, 1e-6, "Pipeline PID output mismatch")
@@ -139,6 +203,9 @@ def test_pipeline_chain() -> None:
 
 
 def test_llm_api_and_performance() -> None:
+    _assert("fft" in list_supported_blocks(), "LLM API supported list missing fft")
+
+    register_block_type("scale", lambda cfg, name: _ScaleBlock(config=cfg, name=name))
     pipeline = create_pipeline(
         {
             "timing_window": 128,
@@ -151,7 +218,8 @@ def test_llm_api_and_performance() -> None:
                         "output_key": "value_ma",
                         "window_size": 4,
                     },
-                }
+                },
+                {"type": "scale", "config": {"name": "scale", "factor": 2.0}},
             ],
         }
     )
@@ -176,7 +244,7 @@ def test_llm_api_and_performance() -> None:
         last = process_frame(pipeline, {"value": float(i % 7), "timestamp": float(i)})
     elapsed = time.perf_counter() - start
 
-    _assert(isinstance(last, dict) and "control" in last, "LLM API process_frame output mismatch")
+    _assert(isinstance(last, dict) and "control" in last and "scaled" in last, "LLM API process_frame output mismatch")
 
     avg_ms = (elapsed / 5000.0) * 1000.0
     _assert(avg_ms < 1.0, f"Simple block chain must stay under 1ms average, got {avg_ms:.4f}ms")
@@ -189,11 +257,45 @@ def test_llm_api_and_performance() -> None:
     _assert(removed, "LLM API remove_block failed")
 
 
+def test_pipeline_thread_safety_and_error_path() -> None:
+    pipeline = AlgorithmPipeline(timing_window=64)
+    pipeline.register_block(MovingAverageBlock(config={"window_size": 4}, name="ma"))
+    pipeline.register_block(PIDBlock(config={"setpoint": 1.0}, name="pid"))
+
+    errors: list[Exception] = []
+
+    def worker(seed: int) -> None:
+        try:
+            for i in range(300):
+                value = float((seed + i) % 11)
+                output = pipeline.process({"value": value, "timestamp": float(seed * 1000 + i)})
+                if "pid_output" not in output:
+                    raise RuntimeError("missing pid output")
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(idx,), daemon=True) for idx in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    _assert(not errors, f"thread safety test errors: {errors}")
+
+    # Error path should be captured without crashing pipeline.
+    err_pipeline = AlgorithmPipeline(timing_window=32)
+    err_pipeline.register_block(_FailingBlock(name="boom"))
+    result = err_pipeline.process({"value": 1.0})
+    error_info = result.get("algorithm_pipeline", {}).get("error", {})
+    _assert(error_info.get("block") == "boom", "error path did not annotate failing block")
+
+
 def run_self_test() -> None:
     test_fft_block()
     test_pid_block()
     test_pipeline_chain()
     test_llm_api_and_performance()
+    test_pipeline_thread_safety_and_error_path()
     print("ALGORITHM BLOCKS TEST PASSED")
 
 

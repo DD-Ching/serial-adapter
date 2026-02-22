@@ -16,6 +16,7 @@ class MovingAverageBlock(AlgorithmBlock):
         self._window_size = 8
         self._window: Deque[float] = deque(maxlen=self._window_size)
         self._running_sum = 0.0
+        self._sample_count_total = 0
         self._last_value: float | None = None
         self.initialize(config or {})
 
@@ -29,6 +30,7 @@ class MovingAverageBlock(AlgorithmBlock):
 
         self._window = deque(maxlen=self._window_size)
         self._running_sum = 0.0
+        self._sample_count_total = 0
         self._last_value = None
 
     def process(self, frame: dict[str, Any]) -> dict[str, Any]:
@@ -36,10 +38,7 @@ class MovingAverageBlock(AlgorithmBlock):
         value = self.extract_numeric(frame, self._input_key)
 
         if value is None:
-            out.setdefault("algorithms", {})[self.name] = {
-                "ready": False,
-                "reason": "missing_numeric_input",
-            }
+            self.mark_not_ready(out, self.name, "missing_numeric_input")
             return out
 
         if len(self._window) == self._window_size:
@@ -48,22 +47,29 @@ class MovingAverageBlock(AlgorithmBlock):
         self._running_sum += value
 
         average = self._running_sum / float(len(self._window))
+        self._sample_count_total += 1
         self._last_value = average
 
         out[self._output_key] = average
-        out.setdefault("algorithms", {})[self.name] = {
-            "ready": True,
-            "input_key": self._input_key,
-            "output_key": self._output_key,
-            "window_count": len(self._window),
-            "window_size": self._window_size,
-            "value": average,
-        }
+        self.set_algorithm_output(
+            out,
+            self.name,
+            {
+                "ready": True,
+                "input_key": self._input_key,
+                "output_key": self._output_key,
+                "window_count": len(self._window),
+                "window_size": self._window_size,
+                "samples_total": self._sample_count_total,
+                "value": average,
+            },
+        )
         return out
 
     def reset(self) -> None:
         self._window.clear()
         self._running_sum = 0.0
+        self._sample_count_total = 0
         self._last_value = None
 
     def get_state(self) -> dict[str, Any]:
@@ -73,5 +79,6 @@ class MovingAverageBlock(AlgorithmBlock):
             "output_key": self._output_key,
             "window_size": self._window_size,
             "window_count": len(self._window),
+            "samples_total": self._sample_count_total,
             "last_value": self._last_value,
         }

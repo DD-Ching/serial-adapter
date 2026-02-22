@@ -2,8 +2,8 @@
 
 ## Purpose
 
-`plugins/algorithm_blocks/` provides a modular processing layer for telemetry frames coming from `SerialAdapter`.
-It allows LLM workflows, Python scripts, and external tools to apply signal-processing and control algorithms in a safe, composable pipeline.
+`plugins/algorithm_blocks/` provides a modular processing layer for telemetry frames from `SerialAdapter`.
+It is designed for LLM workflows, Python scripts, and external tools that need safe, composable, real-time algorithms.
 
 ## Architecture
 
@@ -11,43 +11,58 @@ It allows LLM workflows, Python scripts, and external tools to apply signal-proc
 SerialAdapter -> RingBuffer -> AlgorithmPipeline -> TCP/LLM/Control/External tools
 ```
 
-Each block is a reusable Lego-style unit implementing the `AlgorithmBlock` interface:
+Each block is a reusable Lego-style unit implementing `AlgorithmBlock`:
 
 - `initialize(config)`
 - `process(frame) -> dict`
 - `reset()`
 - `get_state() -> dict`
 
-Rules:
+Core guarantees:
 
 - Input frame is never modified in-place
-- `process()` always returns a new frame dict
-- Runtime memory is bounded per block
+- Each `process()` returns a new frame dict
+- Runtime memory is bounded per block/pipeline window
 
 ## Included Blocks
 
-- `FFTBlock` (`fft_block.py`): windowed FFT with dominant-frequency extraction
-- `MovingAverageBlock` (`moving_average_block.py`): bounded O(1) moving average
-- `PIDBlock` (`pid_block.py`): scalar PID controller output
-- `KalmanBlock` (`kalman_block.py`): 1D scalar Kalman filter
+- `FFTBlock` (`fft_block.py`)
+  - Windowed FFT with dominant-frequency extraction
+  - Supports `window_type`: `none`, `hamming`, `hann`
+- `MovingAverageBlock` (`moving_average_block.py`)
+  - O(1) moving average with bounded window
+- `PIDBlock` (`pid_block.py`)
+  - Scalar PID output with optional output clamping
+- `KalmanBlock` (`kalman_block.py`)
+  - 1D scalar Kalman filter
 
 ## Pipeline Manager
 
-`AlgorithmPipeline` (`pipeline.py`) supports:
+`AlgorithmPipeline` (`pipeline.py`) provides:
 
 - Ordered block execution
-- Dynamic `register_block` / `remove_block`
-- Thread-safe processing
-- Per-block timing/error statistics
+- Dynamic block registration/removal
+- Thread-safe processing (serialized execution lock)
+- Bounded timing metrics window
+- Error annotation without pipeline crash
+
+Statistics include:
+
+- frame processed/failed counts
+- per-block average/max latency
+- pipeline average/max latency
+- per-block error counts
 
 ## LLM-Friendly API
 
-`llm_api.py` exposes:
+`llm_api.py` exports:
 
 - `create_pipeline(config)`
 - `add_block(pipeline, type, config)`
 - `remove_block(pipeline, name)`
 - `process_frame(pipeline, frame)`
+- `list_supported_blocks()`
+- `register_block_type(type_name, factory)`
 
 ## Python Example
 
@@ -73,16 +88,20 @@ enhanced = process_frame(pipeline, frame)
 
 ## SerialAdapter Integration Example
 
-Run:
-
 ```bash
 python -m plugins.algorithm_blocks.example_pipeline_with_serial --port /dev/ttyUSB0 --baudrate 115200
 ```
 
 ## Self Test
 
-Run:
-
 ```bash
 python -m plugins.algorithm_blocks.self_test
 ```
+
+Test coverage includes:
+
+- FFT and PID correctness
+- multi-block pipeline chaining
+- LLM API dynamic registration
+- thread-safety behavior
+- timing/memory-bounded checks

@@ -16,10 +16,13 @@ class KalmanBlock(AlgorithmBlock):
         self._r = 1e-2
         self._initial_estimate: float | None = None
         self._initial_error_covariance = 1.0
+        self._estimate_min: float | None = None
+        self._estimate_max: float | None = None
 
         self._x = 0.0
         self._p = 1.0
         self._initialized = False
+        self._sample_count = 0
 
         self.initialize(config or {})
 
@@ -38,6 +41,13 @@ class KalmanBlock(AlgorithmBlock):
             config.get("initial_error_covariance", self._initial_error_covariance)
         )
 
+        estimate_min = config.get("estimate_min", self._estimate_min)
+        estimate_max = config.get("estimate_max", self._estimate_max)
+        self._estimate_min = None if estimate_min is None else float(estimate_min)
+        self._estimate_max = None if estimate_max is None else float(estimate_max)
+
+        if self._estimate_min is not None and self._estimate_max is not None and self._estimate_min > self._estimate_max:
+            raise ValueError("estimate_min must be <= estimate_max")
         if self._q < 0 or self._r <= 0 or self._initial_error_covariance <= 0:
             raise ValueError("invalid kalman configuration")
 
@@ -47,10 +57,7 @@ class KalmanBlock(AlgorithmBlock):
         out = self.copy_frame(frame)
         measurement = self.extract_numeric(frame, self._input_key)
         if measurement is None:
-            out.setdefault("algorithms", {})[self.name] = {
-                "ready": False,
-                "reason": "missing_numeric_input",
-            }
+            self.mark_not_ready(out, self.name, "missing_numeric_input")
             return out
 
         if not self._initialized:
@@ -65,25 +72,36 @@ class KalmanBlock(AlgorithmBlock):
         gain = self._p / (self._p + self._r)
         innovation = measurement - self._x
         self._x = self._x + (gain * innovation)
+        if self._estimate_min is not None:
+            self._x = max(self._estimate_min, self._x)
+        if self._estimate_max is not None:
+            self._x = min(self._estimate_max, self._x)
         self._p = (1.0 - gain) * self._p
+        self._sample_count += 1
 
         out[self._output_key] = self._x
-        out.setdefault("algorithms", {})[self.name] = {
-            "ready": True,
-            "input_key": self._input_key,
-            "output_key": self._output_key,
-            "measurement": measurement,
-            "estimate": self._x,
-            "gain": gain,
-            "innovation": innovation,
-            "error_covariance": self._p,
-        }
+        self.set_algorithm_output(
+            out,
+            self.name,
+            {
+                "ready": True,
+                "input_key": self._input_key,
+                "output_key": self._output_key,
+                "measurement": measurement,
+                "estimate": self._x,
+                "gain": gain,
+                "innovation": innovation,
+                "error_covariance": self._p,
+                "samples": self._sample_count,
+            },
+        )
         return out
 
     def reset(self) -> None:
         self._x = 0.0
         self._p = self._initial_error_covariance
         self._initialized = False
+        self._sample_count = 0
 
     def get_state(self) -> dict[str, Any]:
         return {
@@ -95,4 +113,7 @@ class KalmanBlock(AlgorithmBlock):
             "initialized": self._initialized,
             "estimate": self._x,
             "error_covariance": self._p,
+            "samples": self._sample_count,
+            "estimate_min": self._estimate_min,
+            "estimate_max": self._estimate_max,
         }
