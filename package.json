@@ -7,7 +7,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "self-test": "uv run pytest tests/ -x",
+    "test": "uv run pytest tests/ -x",
     "postinstall": "node scripts/postinstall.mjs",
     "prepare": "husky"
   },
