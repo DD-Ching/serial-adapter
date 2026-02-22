@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
@@ -9,15 +9,45 @@ const READY_TIMEOUT_MS = 10_000;
 /** Package root — one level up from dist/src/. */
 const PKG_ROOT = resolve(import.meta.dirname, "..");
 
+const VENV_PYTHON = resolve(PKG_ROOT, ".venv", "bin", "python");
+
+/**
+ * Ensure a local .venv with dependencies exists.
+ *
+ * If .venv/bin/python is already present, this is a no-op.
+ * Otherwise, attempts `uv sync --frozen --no-dev` to create it.
+ * Returns true if .venv is usable after the call.
+ */
+function ensureVenv(): boolean {
+  if (existsSync(VENV_PYTHON)) return true;
+
+  // Check if uv is available.
+  try {
+    execFileSync("uv", ["--version"], { stdio: "ignore" });
+  } catch {
+    return false;
+  }
+
+  // Run uv sync to create .venv with runtime deps only.
+  try {
+    execFileSync("uv", ["sync", "--frozen", "--no-dev"], {
+      cwd: PKG_ROOT,
+      stdio: "ignore",
+    });
+    return existsSync(VENV_PYTHON);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve the Python interpreter to use.
- * Priority: explicit config > .venv created by postinstall > system python3.
+ * Priority: explicit config > .venv (auto-created via uv) > system python3.
  */
 function resolvePython(config: PluginConfig): string {
   if (config.pythonPath) return config.pythonPath;
 
-  const venvPython = resolve(PKG_ROOT, ".venv", "bin", "python");
-  if (existsSync(venvPython)) return venvPython;
+  if (ensureVenv()) return VENV_PYTHON;
 
   return "python3";
 }
@@ -25,12 +55,10 @@ function resolvePython(config: PluginConfig): string {
 export class PythonLauncher {
   private process: ChildProcess | null = null;
   private config: PluginConfig;
-  private pythonPath: string;
   private readyMessage: ReadyMessage | null = null;
 
   constructor(config: PluginConfig) {
     this.config = config;
-    this.pythonPath = resolvePython(config);
   }
 
   async start(): Promise<ReadyMessage> {
@@ -38,11 +66,11 @@ export class PythonLauncher {
       throw new Error("Python subprocess already running");
     }
 
+    const pythonPath = resolvePython(this.config);
+
     // Run with cwd at the package root so `python -m python` resolves
     // the python/ package directory correctly.
-    const cwd = PKG_ROOT;
-
-    const args = [
+    this.process = spawn(pythonPath, [
       "-m",
       "python",
       "--port",
@@ -55,10 +83,8 @@ export class PythonLauncher {
       String(this.config.controlPort ?? 9001),
       "--host",
       this.config.host ?? "127.0.0.1",
-    ];
-
-    this.process = spawn(this.pythonPath, args, {
-      cwd,
+    ], {
+      cwd: PKG_ROOT,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
