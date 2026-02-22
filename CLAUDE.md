@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Plugin Development Reference
+
+This is an [OpenClaw plugin](https://docs.openclaw.ai/tools/plugin). Follow that guide for manifest format, lifecycle hooks, config schema, tool registration, and installation methods.
+
 ## Commit Convention
 
 Use [Conventional Commits](https://www.conventionalcommits.org/):
