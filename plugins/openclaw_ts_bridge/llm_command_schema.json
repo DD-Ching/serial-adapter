@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LLM Safe Control Command",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "set" },
+        "target": {
+          "type": "string",
+          "enum": ["target_velocity", "motor_pwm", "servo_pos"]
+        },
+        "value": { "type": "number" }
+      },
+      "required": ["cmd", "target", "value"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "stop" }
+      },
+      "required": ["cmd"],
+      "additionalProperties": false
+    }
+  ]
+}

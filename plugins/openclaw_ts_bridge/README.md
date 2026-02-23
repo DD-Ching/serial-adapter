@@ -79,6 +79,61 @@ ACK shape:
 {"type":"control_ack","ok":true,"cmd":"set_window","result":{"applied":true},"state":{...}}
 ```
 
+## LLM Safe Control (low-rate)
+
+Use `plugins/openclaw_ts_bridge/send_llm_command.js` for agent-facing control.
+
+LLM command schema:
+
+```json
+{"cmd":"set","target":"target_velocity|motor_pwm|servo_pos","value":1.23}
+```
+
+Optional safe stop:
+
+```json
+{"cmd":"stop"}
+```
+
+This layer enforces:
+- target allowlist when `unsafe_passthrough=false` (default)
+- LLM-side rate limit (default `5 cmd/sec`) before sending to control port
+
+Examples:
+
+1) `servo_pos` 0 / 90 / 180
+
+```bash
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 0
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 180
+```
+
+2) `target_velocity` 1.5
+
+```bash
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target target_velocity --value 1.5
+```
+
+3) `stop`
+
+```bash
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd stop
+```
+
+Output ACK shape:
+
+```json
+{
+  "type": "llm_command_ack",
+  "ok": true,
+  "input": {"cmd":"set","target":"servo_pos","value":90},
+  "translated": {"servo_angle":90},
+  "send": {"sent": true, "response": null},
+  "limiter": {"maxCommandsPerSec":5,"inCurrentWindow":1,"remaining":4}
+}
+```
+
 ## Notes
 
 - No per-frame output.
