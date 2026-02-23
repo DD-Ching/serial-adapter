@@ -23,6 +23,13 @@ const DEFAULT_CONFIG = {
     keys: ["velocity", "pos", "value"],
     window: 64,
     interval_ms: 1000,
+    events: {
+      stable_delta_threshold: 0.25,
+      stable_required_windows: 3,
+      spike_delta_threshold: 3.0,
+      oscillating_window: 6,
+      oscillating_flip_threshold: 3,
+    },
   },
   blocks: {
     summarizer: {
@@ -72,6 +79,49 @@ function normalizeKeys(keys, fallback) {
   return out.length > 0 ? out : cloneJson(fallback);
 }
 
+function normalizeEventConfig(events, fallback) {
+  const source = isObject(events) ? events : {};
+  const next = {
+    stable_delta_threshold: Number(
+      source.stable_delta_threshold ?? fallback.stable_delta_threshold,
+    ),
+    stable_required_windows: Math.floor(
+      Number(source.stable_required_windows ?? fallback.stable_required_windows),
+    ),
+    spike_delta_threshold: Number(
+      source.spike_delta_threshold ?? fallback.spike_delta_threshold,
+    ),
+    oscillating_window: Math.floor(
+      Number(source.oscillating_window ?? fallback.oscillating_window),
+    ),
+    oscillating_flip_threshold: Math.floor(
+      Number(
+        source.oscillating_flip_threshold ?? fallback.oscillating_flip_threshold,
+      ),
+    ),
+  };
+
+  if (!Number.isFinite(next.stable_delta_threshold) || next.stable_delta_threshold < 0) {
+    next.stable_delta_threshold = fallback.stable_delta_threshold;
+  }
+  if (!Number.isFinite(next.spike_delta_threshold) || next.spike_delta_threshold < 0) {
+    next.spike_delta_threshold = fallback.spike_delta_threshold;
+  }
+  if (!Number.isFinite(next.stable_required_windows) || next.stable_required_windows < 1) {
+    next.stable_required_windows = fallback.stable_required_windows;
+  }
+  if (!Number.isFinite(next.oscillating_window) || next.oscillating_window < 2) {
+    next.oscillating_window = fallback.oscillating_window;
+  }
+  if (
+    !Number.isFinite(next.oscillating_flip_threshold) ||
+    next.oscillating_flip_threshold < 1
+  ) {
+    next.oscillating_flip_threshold = fallback.oscillating_flip_threshold;
+  }
+  return next;
+}
+
 function loadConfigFile(configPath) {
   const raw = readFileSync(configPath, "utf8");
   const parsed = JSON.parse(raw);
@@ -101,6 +151,10 @@ function mergeConfig(base, loaded) {
       next.summary.interval_ms = Number(loaded.summary.interval_ms);
     }
     next.summary.keys = normalizeKeys(loaded.summary.keys, next.summary.keys);
+    next.summary.events = normalizeEventConfig(
+      loaded.summary.events,
+      next.summary.events,
+    );
   }
 
   if (isObject(loaded.blocks)) {
@@ -125,11 +179,13 @@ function mergeConfig(base, loaded) {
     100,
     Math.floor(Number(next.summary.interval_ms)),
   );
-  next.telemetry.port = Math.max(1, Math.floor(Number(next.telemetry.port)));
-  next.blocks.summarizer.config.keys = normalizeKeys(
-    next.blocks.summarizer.config.keys,
-    next.summary.keys,
+  next.summary.keys = normalizeKeys(next.summary.keys, DEFAULT_CONFIG.summary.keys);
+  next.summary.events = normalizeEventConfig(
+    next.summary.events,
+    DEFAULT_CONFIG.summary.events,
   );
+  next.telemetry.port = Math.max(1, Math.floor(Number(next.telemetry.port)));
+  next.blocks.summarizer.config.keys = cloneJson(next.summary.keys);
   next.blocks.summarizer.config.window = next.summary.window;
   return next;
 }
@@ -229,14 +285,72 @@ function pickSummaryFields(summaryObj) {
 
   for (const [key, snapshot] of Object.entries(summaryObj)) {
     if (!snapshot || typeof snapshot !== "object") continue;
-    out[key] = {
-      mean: snapshot.mean,
-      delta: snapshot.delta,
-      min: snapshot.min,
-      max: snapshot.max,
-    };
+    const mean = Number(snapshot.mean);
+    const delta = Number(snapshot.delta);
+    const min = Number(snapshot.min);
+    const max = Number(snapshot.max);
+    if (![mean, delta, min, max].every(Number.isFinite)) continue;
+    out[key] = { mean, delta, min, max };
   }
   return out;
+}
+
+function createEventDetector(eventConfig) {
+  let config = normalizeEventConfig(eventConfig, DEFAULT_CONFIG.summary.events);
+  let stableWindows = 0;
+  const signHistory = [];
+
+  return {
+    update(keysSummary) {
+      const deltas = Object.values(keysSummary)
+        .map((item) => Number(item?.delta))
+        .filter((value) => Number.isFinite(value));
+
+      if (deltas.length === 0) {
+        return {
+          stable: false,
+          spike: false,
+          oscillating: false,
+        };
+      }
+
+      const maxAbsDelta = Math.max(...deltas.map((value) => Math.abs(value)));
+      const aggregateDelta = deltas.reduce((acc, value) => acc + value, 0) / deltas.length;
+      const sign = aggregateDelta > 0 ? 1 : aggregateDelta < 0 ? -1 : 0;
+
+      if (maxAbsDelta < config.stable_delta_threshold) {
+        stableWindows += 1;
+      } else {
+        stableWindows = 0;
+      }
+
+      if (sign !== 0) {
+        signHistory.push(sign);
+        while (signHistory.length > config.oscillating_window) {
+          signHistory.shift();
+        }
+      }
+
+      let flips = 0;
+      for (let i = 1; i < signHistory.length; i += 1) {
+        if (signHistory[i] !== signHistory[i - 1]) flips += 1;
+      }
+
+      return {
+        stable: stableWindows >= config.stable_required_windows,
+        spike: maxAbsDelta > config.spike_delta_threshold,
+        oscillating: flips >= config.oscillating_flip_threshold,
+      };
+    },
+    reset(nextConfig) {
+      config = normalizeEventConfig(nextConfig, config);
+      stableWindows = 0;
+      signHistory.length = 0;
+    },
+    getConfig() {
+      return cloneJson(config);
+    },
+  };
 }
 
 function main() {
@@ -267,9 +381,11 @@ function main() {
   let totalLines = 0;
   let totalFrames = 0;
   let parseErrors = 0;
+  let framesSinceLastSummary = 0;
   let isClosing = false;
   let logTimer = null;
 
+  const eventDetector = createEventDetector(runtimeConfig.summary.events);
   const socket = createConnection({
     host: runtimeConfig.telemetry.host,
     port: runtimeConfig.telemetry.port,
@@ -298,7 +414,10 @@ function main() {
       .map(([name]) => name);
     return {
       telemetry: cloneJson(runtimeConfig.telemetry),
-      summary: cloneJson(runtimeConfig.summary),
+      summary: {
+        ...cloneJson(runtimeConfig.summary),
+        events: eventDetector.getConfig(),
+      },
       blocks: cloneJson(runtimeConfig.blocks),
       active_blocks: activeBlocks,
     };
@@ -310,19 +429,19 @@ function main() {
       if (!pipeline) return;
       const latest = pipeline.getLatest();
       const latestSummary = latest?.features?.summary ?? {};
-      const compact = pickSummaryFields(latestSummary);
+      const compactKeys = pickSummaryFields(latestSummary);
+      const events = eventDetector.update(compactKeys);
 
       console.log(
         JSON.stringify({
-          type: "bridge_summary",
+          type: "summary",
           ts: Date.now(),
-          frames: totalFrames,
-          parse_errors: parseErrors,
-          interval_ms: runtimeConfig.summary.interval_ms,
-          stats_window: runtimeConfig.summary.window,
-          fields: compact,
+          n: framesSinceLastSummary,
+          keys: compactKeys,
+          events,
         }),
       );
+      framesSinceLastSummary = 0;
     }, runtimeConfig.summary.interval_ms);
   };
 
@@ -346,6 +465,15 @@ function main() {
         return { applied: true };
       }
       case "set_param": {
+        if (blockName === "events") {
+          runtimeConfig.summary.events[command.key] = command.value;
+          runtimeConfig.summary.events = normalizeEventConfig(
+            runtimeConfig.summary.events,
+            DEFAULT_CONFIG.summary.events,
+          );
+          eventDetector.reset(runtimeConfig.summary.events);
+          return { applied: true };
+        }
         if (!runtimeConfig.blocks[blockName]) {
           throw new Error(`unknown block_name: ${blockName}`);
         }
@@ -363,6 +491,7 @@ function main() {
           const window = Math.max(1, Math.floor(Number(command.value)));
           runtimeConfig.summary.window = window;
           runtimeConfig.blocks.summarizer.config.window = window;
+          eventDetector.reset(runtimeConfig.summary.events);
         }
         buildPipeline();
         return { applied: true };
@@ -382,6 +511,7 @@ function main() {
         runtimeConfig.summary.window = Math.max(1, Math.floor(command.window));
         runtimeConfig.blocks.summarizer.config.window = runtimeConfig.summary.window;
         buildPipeline();
+        eventDetector.reset(runtimeConfig.summary.events);
         return { applied: true };
       }
       case "set_interval_ms": {
@@ -467,6 +597,7 @@ function main() {
       if (!pipeline) continue;
       pipeline.process(toFrame(rawLine, parsedPayload));
       totalFrames += 1;
+      framesSinceLastSummary += 1;
     }
   });
 

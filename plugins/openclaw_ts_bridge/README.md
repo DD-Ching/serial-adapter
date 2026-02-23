@@ -1,10 +1,9 @@
 # openclaw_ts_bridge
 
-Observer-mode runtime bridge:
-- Reads telemetry JSON-lines from TCP (`127.0.0.1:9000` by default)
-- Processes locally with `AlgorithmPipeline + SummarizerBlock` (optional PID block)
-- Prints compact summary once per interval (default 1s)
-- Accepts control-plane JSON commands from stdin to hot-update pipeline config
+LLM-friendly observer bridge:
+- Reads telemetry JSON-lines from TCP (default `127.0.0.1:9000`)
+- Processes locally with `AlgorithmPipeline + SummarizerBlock` (optional PID)
+- Emits low-frequency compact summaries only (default every `1000ms`)
 
 ## Run
 
@@ -16,42 +15,72 @@ node plugins/openclaw_ts_bridge/bridge.js
 node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/config.json
 ```
 
-## Control Plane Commands (stdin)
+## Summary Output Schema
 
-While bridge is running, paste one JSON command per line.
+Every `interval_ms`, bridge prints exactly:
 
-1) Change keys
-```json
-{"cmd":"set_keys","keys":["pos","velocity"]}
-```
-
-2) Change window
-```json
-{"cmd":"set_window","window":32}
-```
-
-3) Enable PID block
-```json
-{"cmd":"enable_block","block_name":"pid"}
-```
-
-Expected ACK format (example):
 ```json
 {
-  "type": "control_ack",
-  "ok": true,
-  "cmd": "set_window",
-  "result": { "applied": true },
-  "state": {
-    "summary": { "window": 32, "interval_ms": 1000, "keys": ["pos","velocity"] },
-    "active_blocks": ["summarizer","pid"]
+  "type": "summary",
+  "ts": 1735689600123,
+  "n": 50,
+  "keys": {
+    "velocity": { "mean": 5.1, "delta": 0.2, "min": 4.8, "max": 5.4 },
+    "pos": { "mean": 93.0, "delta": -1.0, "min": 90.0, "max": 98.0 }
+  },
+  "events": {
+    "stable": false,
+    "spike": false,
+    "oscillating": true
   }
 }
 ```
 
+Meaning:
+- `n`: frames processed since last summary interval
+- `keys`: compact numeric features only
+- `events`: cheap state flags for agent logic
+
+## Event Detection (cheap + configurable)
+
+Config path: `summary.events` in `config.json`
+
+- `stable`: `abs(delta) < stable_delta_threshold` for `stable_required_windows` consecutive summaries
+- `spike`: any key has `abs(delta) > spike_delta_threshold`
+- `oscillating`: aggregate delta sign flips at least `oscillating_flip_threshold` times within `oscillating_window` summaries
+
+Default thresholds:
+
+```json
+{
+  "stable_delta_threshold": 0.25,
+  "stable_required_windows": 3,
+  "spike_delta_threshold": 3.0,
+  "oscillating_window": 6,
+  "oscillating_flip_threshold": 3
+}
+```
+
+## Control Plane (stdin)
+
+One JSON command per line while bridge runs.
+
+Examples:
+
+```json
+{"cmd":"set_keys","keys":["pos","velocity"]}
+{"cmd":"set_window","window":32}
+{"cmd":"set_param","block_name":"events","key":"spike_delta_threshold","value":1.5}
+```
+
+ACK shape:
+
+```json
+{"type":"control_ack","ok":true,"cmd":"set_window","result":{"applied":true},"state":{...}}
+```
+
 ## Notes
 
-- Summary output is JSON line `type=bridge_summary` every interval.
-- No per-frame log output.
-- Ctrl+C exits cleanly and prints `type=bridge_shutdown`.
-- Command schema is in `plugins/openclaw_ts_bridge/command_schema.json`.
+- No per-frame output.
+- Summary is interval-throttled only.
+- Ctrl+C exits cleanly and prints `bridge_shutdown`.

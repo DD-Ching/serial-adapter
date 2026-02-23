@@ -6,7 +6,14 @@
   "summary": {
     "keys": ["velocity", "pos", "value"],
     "window": 64,
-    "interval_ms": 1000
+    "interval_ms": 1000,
+    "events": {
+      "stable_delta_threshold": 0.25,
+      "stable_required_windows": 3,
+      "spike_delta_threshold": 3.0,
+      "oscillating_window": 6,
+      "oscillating_flip_threshold": 3
+    }
   },
   "blocks": {
     "summarizer": {
