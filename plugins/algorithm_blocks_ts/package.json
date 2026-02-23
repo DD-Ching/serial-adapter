@@ -1,0 +1,23 @@
+{
+  "name": "@openclaw/algorithm-blocks-ts",
+  "version": "0.1.0",
+  "description": "Minimal TypeScript algorithm blocks pipeline for OpenClaw plugins",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "files": [
+    "dist/",
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "example": "npm run build && node dist/src/example.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.7.2"
+  },
+  "license": "MIT"
+}
