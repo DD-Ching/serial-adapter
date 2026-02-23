@@ -7,6 +7,12 @@
     "properties": {
       "pythonPath": { "type": "string", "default": "python3" },
       "serialPort": { "type": "string" },
+      "autoDetectSerialPort": { "type": "boolean", "default": true },
+      "portHints": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["arduino", "uno", "ch340", "cp210", "ftdi", "usb serial", "ttyusb", "ttyacm", "com"]
+      },
       "baudrate": { "type": "number", "default": 115200 },
       "telemetryPort": { "type": "number", "default": 9000 },
       "controlPort": { "type": "number", "default": 9001 },

@@ -13,8 +13,10 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 - RingBuffer-based frame assembly for fragmented serial input
 - TCP telemetry stream (read-only broadcast, default `9000`)
 - TCP control channel (write-only commands, default `9001`)
+- Auto serial-port probing with best-effort UNO/USB-serial matching
 - Observer API (`poll`, `poll_all`, `register_callback`, `get_latest_frame`, `get_last_n_frames`)
 - Control safety enforcement (`unsafe_passthrough`, allowlist, rate limiting)
+- Built-in motion templates (`slow_sway`, `fast_jitter`, `sweep`, `center_stop`)
 - Runtime status reporting (`get_status`)
 - Stability tested with long-duration 100Hz telemetry run
 
@@ -72,7 +74,8 @@ Add to your OpenClaw config (`openclaw.json`):
       "serial-adapter": {
         "enabled": true,
         "config": {
-          "serialPort": "COM3",
+          "autoDetectSerialPort": true,
+          "portHints": ["uno", "arduino", "ch340"],
           "baudrate": 115200,
           "telemetryPort": 9000,
           "controlPort": 9001,
@@ -89,6 +92,8 @@ Add to your OpenClaw config (`openclaw.json`):
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `serialPort` | string | none | Serial device path. If omitted, provide `port` in `serial_connect`. |
+| `autoDetectSerialPort` | boolean | `true` | Auto-detect a likely serial port when `serialPort` is missing. |
+| `portHints` | string[] | `["arduino","uno","ch340","cp210","ftdi","usb serial","ttyusb","ttyacm","com"]` | Hint list used for auto-detection scoring. |
 | `baudrate` | number | `115200` | Serial baud rate |
 | `telemetryPort` | number | `9000` | TCP telemetry broadcast port |
 | `controlPort` | number | `9001` | TCP control command port |
@@ -102,9 +107,11 @@ Add to your OpenClaw config (`openclaw.json`):
 
 | Tool | Description |
 |---|---|
+| `serial_probe` | List detected serial ports and suggest the best candidate |
 | `serial_connect` | Connect to serial device and start adapter |
 | `serial_poll` | Read available telemetry frames |
 | `serial_send` | Send a control command to serial device |
+| `serial_motion_template` | Run built-in servo motion templates |
 | `serial_status` | Get adapter runtime status |
 
 ## AI Prompt Examples
@@ -113,7 +120,7 @@ Use prompts like these with your OpenClaw agent:
 
 1. Connect and check status:
 ```text
-Use serial_connect with port COM3 and baudrate 115200, then call serial_status.
+Call serial_probe first and pick the suggested port, then run serial_connect with baudrate 115200, then call serial_status.
 ```
 
 2. Servo sweep test (visible frequency / PWM change):
@@ -127,6 +134,20 @@ After each step, call serial_poll and summarize latest telemetry.
 ```text
 Send a final command {"motor_pwm": 0}, then call serial_status.
 ```
+
+4. Run template motion directly:
+```text
+Run serial_motion_template with template "slow_sway", repeats 2, intervalMs 400.
+```
+
+## Prototype Status
+
+- Current implementation is closer to your **Prototype B** baseline:
+  - includes ring buffer
+  - includes built-in motion templates
+  - includes auto probe + best-effort auto connect
+- It does **not** yet include closed-loop self-stabilizing controllers (PID/LQR/MPC).
+- If you need autonomous balancing/stabilization, add firmware feedback fields (angle/rate/error) and a closed-loop controller module on top of this transport layer.
 
 ## Safety Notes
 

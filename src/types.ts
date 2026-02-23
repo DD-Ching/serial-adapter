@@ -1,6 +1,6 @@
 export interface PluginConfig {
   pythonPath?: string;
-  serialPort: string;
+  serialPort?: string;
   baudrate?: number;
   telemetryPort?: number;
   controlPort?: number;
@@ -8,6 +8,21 @@ export interface PluginConfig {
   unsafePassthrough?: boolean;
   allowedCommands?: string[];
   maxControlRate?: number;
+  autoDetectSerialPort?: boolean;
+  portHints?: string[];
+}
+
+export interface SerialPortInfo {
+  device: string;
+  name?: string | null;
+  description?: string | null;
+  hwid?: string | null;
+  vid?: number | null;
+  pid?: number | null;
+  manufacturer?: string | null;
+  product?: string | null;
+  serialNumber?: string | null;
+  interface?: string | null;
 }
 
 export interface ReadyMessage {
