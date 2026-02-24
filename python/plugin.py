@@ -76,6 +76,7 @@ ADAPTER_CMD_KEY = "__adapter_cmd"
 ADAPTER_CMD_PAUSE = "pause"
 ADAPTER_CMD_RESUME = "resume"
 ADAPTER_CMD_STATUS = "status"
+ADAPTER_CMD_CAPABILITIES = "capabilities"
 
 
 class SerialAdapter:
@@ -888,6 +889,15 @@ class SerialAdapter:
                 "status": self.get_status(),
             }
 
+        if action == ADAPTER_CMD_CAPABILITIES:
+            return {
+                "type": "adapter_runtime_ack",
+                "ok": True,
+                "action": ADAPTER_CMD_CAPABILITIES,
+                "capabilities": self.get_capabilities(),
+                "status": self.get_status(),
+            }
+
         return {
             "type": "adapter_runtime_ack",
             "ok": False,
@@ -1015,6 +1025,69 @@ class SerialAdapter:
             "serial_port": self._port,
             "serial_baudrate": int(self._baudrate),
             "degraded": (not serial_connected) or serial_paused,
+        }
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        telemetry_endpoint = self.get_tcp_endpoint()
+        control_endpoint = self.get_control_endpoint()
+        return {
+            "runtime_protocol_version": "1.0",
+            "transport": {
+                "telemetry": "tcp_jsonl",
+                "control": "tcp_jsonl",
+                "telemetry_endpoint": (
+                    {
+                        "host": telemetry_endpoint[0],
+                        "port": int(telemetry_endpoint[1]),
+                    }
+                    if telemetry_endpoint
+                    else None
+                ),
+                "control_endpoint": (
+                    {
+                        "host": control_endpoint[0],
+                        "port": int(control_endpoint[1]),
+                    }
+                    if control_endpoint
+                    else None
+                ),
+            },
+            "telemetry": {
+                "raw_forward_enabled": True,
+                "known_numeric_fields": [
+                    "ax",
+                    "ay",
+                    "az",
+                    "gx",
+                    "gy",
+                    "gz",
+                    "servo",
+                    "target_velocity",
+                    "motor_pwm",
+                ],
+                "llm_observer_mode": "summary_only_recommended",
+            },
+            "control": {
+                "unsafe_passthrough": bool(self._unsafe_passthrough),
+                "allowlist_enabled": not bool(self._unsafe_passthrough),
+                "allowed_commands": sorted(self._allowed_commands),
+                "raw_line_protocol": {
+                    "angle": "A<0..180> or <0..180>",
+                    "pulse": "P<500..2500>",
+                    "probe_examples": sorted(PROBE_CONTROL_COMMANDS),
+                },
+                "max_control_rate_per_sec": int(self._max_control_rate),
+            },
+            "runtime_commands": [
+                ADAPTER_CMD_PAUSE,
+                ADAPTER_CMD_RESUME,
+                ADAPTER_CMD_STATUS,
+                ADAPTER_CMD_CAPABILITIES,
+            ],
+            "safety": {
+                "queue_on_serial_unavailable": True,
+                "max_queued_control": int(self._max_queued_control),
+            },
         }
 
     def get_tcp_endpoint(self) -> Optional[Tuple[str, int]]:

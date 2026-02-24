@@ -44,8 +44,9 @@ Optional hardware live checks:
 # telemetry snapshot
 python examples/tcp_client_print.py --host 127.0.0.1 --port 9000
 
-# raw servo MVP command
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "90"
+# servo + status without PowerShell JSON quoting issues
+python examples/runtime_ops.py status
+python examples/runtime_ops.py servo --angle 90
 ```
 
 ## 6) Mandatory Discussion Gate

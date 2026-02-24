@@ -38,6 +38,10 @@ Legacy or optional (kept, not removed):
 
 Goal: read telemetry (`9000`), print low-rate summary, send low-rate control (`9001`) with clear ACK.
 
+Windows note:
+- Use `docs/windows-runtime-playbook.md` to avoid repeated PATH/quoting/COM pitfalls.
+- Prefer absolute tool paths on Windows shells.
+
 1. Quick self-check (node path, dist artifact, port status, serial probe):
 
 Windows:
@@ -84,6 +88,9 @@ Before opening any PR, run and review:
 
 Rule: if checklist is not fully green, stop and fix first.
 
+Baseline marker for this development cycle:
+- `docs/release/BASELINE_2026-02-24.md`
+
 ## COM Port Guardrail (Upload vs Runtime)
 
 - A single COM port cannot be used by uploader/Serial Monitor and runtime plugin at the same time.
@@ -98,13 +105,13 @@ You can now ask runtime to temporarily release COM for upload, then auto/manual 
 Pause and release COM immediately (hold for 30s):
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"pause\",\"hold_s\":30}"
+python examples/runtime_ops.py pause --hold-s 30
 ```
 
 Resume COM right after upload:
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"resume\"}"
+python examples/runtime_ops.py resume
 ```
 
 One-shot upload flow (auto pause/resume around `arduino-cli upload`):
@@ -116,7 +123,8 @@ node plugins/openclaw_ts_bridge/upload_with_pause.js --com COM3 --fqbn arduino:a
 Check runtime serial status:
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"status\"}"
+python examples/runtime_ops.py status
+python examples/runtime_ops.py capabilities
 ```
 
 Behavior:
@@ -295,6 +303,12 @@ Run serial_motion_template with template "slow_sway", repeats 2, intervalMs 400.
 python -m pytest tests/test_tcp_server.py tests/test_adapter.py
 ```
 
+### Run hardware regression guard (observer + control + IMU fields)
+
+```bash
+python scripts/regression_guard.py --host 127.0.0.1 --control-port 9001 --telemetry-port 9000 --timeout-s 3 --angle 90
+```
+
 ### Monitor telemetry (standalone)
 
 ```bash
@@ -304,7 +318,8 @@ python examples/tcp_monitor.py --host 127.0.0.1 --port 9000
 ### Send control command (standalone)
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"target_velocity\":1.5}"
+python examples/runtime_ops.py set --target target_velocity --value 1.5
+python examples/runtime_ops.py servo --angle 90
 ```
 
 ### Build TypeScript
@@ -334,3 +349,4 @@ OpenClaw Gateway
 
 - Protocol: `docs/protocol.md`
 - Architecture: `docs/architecture.md`
+- Windows runtime playbook: `docs/windows-runtime-playbook.md`

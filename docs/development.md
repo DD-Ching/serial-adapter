@@ -88,6 +88,20 @@ Once loaded, the AI can invoke:
 - `serial_send` — send control commands
 - `serial_status` — check adapter status
 
+### Windows shell note (important)
+
+PowerShell can mangle inline JSON arguments for external commands.
+Use `examples/runtime_ops.py` for runtime control instead of hand-typed JSON:
+
+```powershell
+python examples/runtime_ops.py status
+python examples/runtime_ops.py servo --angle 90
+python examples/runtime_ops.py pause --hold-s 30
+python examples/runtime_ops.py resume
+```
+
+See `docs/windows-runtime-playbook.md` for the full anti-footgun checklist.
+
 ### Development loop
 
 After making changes:

@@ -57,6 +57,36 @@ export function validateCommand(command) {
       }
       return { ok: true };
 
+    case "set_profile":
+      if (typeof command.profile !== "string" || !command.profile.trim()) {
+        return { ok: false, error: "profile must be a non-empty string" };
+      }
+      return { ok: true };
+
+    case "save_state":
+      if (
+        Object.prototype.hasOwnProperty.call(command, "path") &&
+        (typeof command.path !== "string" || !command.path.trim())
+      ) {
+        return { ok: false, error: "path must be a non-empty string when provided" };
+      }
+      return { ok: true };
+
+    case "load_state":
+      if (
+        Object.prototype.hasOwnProperty.call(command, "path") &&
+        (typeof command.path !== "string" || !command.path.trim())
+      ) {
+        return { ok: false, error: "path must be a non-empty string when provided" };
+      }
+      return { ok: true };
+
+    case "set_autosave":
+      if (typeof command.enabled !== "boolean") {
+        return { ok: false, error: "enabled must be boolean" };
+      }
+      return { ok: true };
+
     default:
       return { ok: false, error: `unsupported cmd: ${command.cmd}` };
   }
