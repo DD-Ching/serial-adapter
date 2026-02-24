@@ -8,11 +8,12 @@
     "test": "uv run pytest tests/ -x",
     "quick-check": "node scripts/quick_self_check.js",
     "postinstall": "node scripts/postinstall.mjs",
-    "prepare": "husky"
+    "prepare": "node scripts/prepare.mjs",
+    "prepack": "npm run build"
   },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "dependencies": {
@@ -26,13 +27,13 @@
     "typescript": "^5.4.0"
   },
   "files": [
-    "index.ts",
-    "src/",
-    "python/",
+    "dist/",
+    "python/*.py",
     "scripts/",
     "openclaw.plugin.json",
     "pyproject.toml",
-    "uv.lock"
+    "uv.lock",
+    "README.md"
   ],
   "license": "MIT"
 }

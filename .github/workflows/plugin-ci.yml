@@ -1,0 +1,44 @@
+name: plugin-ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - feature/**
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: Build TS
+        run: npm run build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyserial pytest
+
+      - name: Run Python unit tests
+        run: pytest tests/test_adapter.py tests/test_tcp_server.py tests/test_ring_buffer.py tests/test_statistics.py -q
+
+      - name: Validate package contents
+        run: npm pack --dry-run
