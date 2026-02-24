@@ -107,6 +107,12 @@ Resume COM right after upload:
 python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"resume\"}"
 ```
 
+One-shot upload flow (auto pause/resume around `arduino-cli upload`):
+
+```bash
+node plugins/openclaw_ts_bridge/upload_with_pause.js --com COM3 --fqbn arduino:avr:uno --sketch C:\\path\\to\\sketch
+```
+
 Check runtime serial status:
 
 ```bash
@@ -117,6 +123,7 @@ Behavior:
 - `pause` closes serial handle but keeps plugin process/TCP ports alive.
 - During pause, adapter does not occupy COM.
 - After `resume` (or `hold_s` timeout), adapter retries reopening COM every ~2s.
+- Control commands received during COM pause/conflict are queued (bounded queue) and flushed automatically after reconnect.
 - If there is no COM conflict, keep runtime normal (no pause/resume needed).
 
 ## Installation

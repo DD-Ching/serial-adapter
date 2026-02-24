@@ -55,6 +55,7 @@ __all__ = [
 DEFAULT_ALLOWED_COMMANDS: tuple[str, ...] = ("motor_pwm", "target_velocity")
 DEFAULT_MAX_CONTROL_RATE = 50
 DEFAULT_REOPEN_INTERVAL_S = 2.0
+DEFAULT_MAX_QUEUED_CONTROL = 128
 RAW_CONTROL_PATTERN = re.compile(
     r"^(?:A-?\d{1,4}|P-?\d{1,5}|-?\d{1,4})$",
     flags=re.IGNORECASE,
@@ -96,6 +97,7 @@ class SerialAdapter:
         unsafe_passthrough: bool = False,
         allowed_commands: Optional[List[str]] = None,
         max_control_rate: int = DEFAULT_MAX_CONTROL_RATE,
+        max_queued_control: int = DEFAULT_MAX_QUEUED_CONTROL,
     ) -> None:
         self._port = port
         self._baudrate = int(baudrate)
@@ -106,11 +108,14 @@ class SerialAdapter:
         else:
             self._allowed_commands = {str(cmd) for cmd in allowed_commands if str(cmd)}
         self._max_control_rate = int(max_control_rate)
+        self._max_queued_control = max(1, int(max_queued_control))
         self._control_timestamps: Deque[float] = deque()
         self._rx_timestamps: Deque[float] = deque()
         self._tx_timestamps: Deque[float] = deque()
         self._control_commands_accepted = 0
         self._control_commands_rejected = 0
+        self._control_commands_queued = 0
+        self._queued_control_dropped = 0
 
         self._serial: Optional[Any] = None
         self._serial_reopen_interval_s = float(DEFAULT_REOPEN_INTERVAL_S)
@@ -129,6 +134,7 @@ class SerialAdapter:
         self._latest_frame: Optional[Dict[str, Any]] = None
         self._frame_history: Deque[Dict[str, Any]] = deque(maxlen=self._max_frames)
         self._pending_frames: Deque[Dict[str, Any]] = deque()
+        self._queued_control: Deque[Tuple[str, Any]] = deque()
         self._callbacks: List[Callable[[Dict[str, Any]], None]] = []
 
         self._serial_lock = threading.Lock()
@@ -136,6 +142,7 @@ class SerialAdapter:
         self._callback_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._control_lock = threading.Lock()
+        self._queue_lock = threading.Lock()
         self._status_lock = threading.Lock()
 
         self._reader_stop = threading.Event()
@@ -186,6 +193,10 @@ class SerialAdapter:
             self._tx_timestamps.clear()
             self._control_commands_accepted = 0
             self._control_commands_rejected = 0
+            self._control_commands_queued = 0
+            self._queued_control_dropped = 0
+        with self._queue_lock:
+            self._queued_control.clear()
         with self._frame_lock:
             self._latest_frame = None
             self._frame_history.clear()
@@ -506,9 +517,12 @@ class SerialAdapter:
                 if not has_serial and not self._maybe_reopen_serial():
                     time.sleep(self._reader_sleep_s)
                     continue
+                has_serial = True
 
                 chunk = self._read_serial_chunk_nonblocking()
                 emitted = self._process_chunk(chunk)
+                if has_serial:
+                    self._flush_queued_control(max_items=8)
                 if not chunk and not emitted:
                     time.sleep(self._reader_sleep_s)
             except RuntimeError as exc:
@@ -530,6 +544,7 @@ class SerialAdapter:
                 return None
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
+            self._flush_queued_control(max_items=8)
 
         with self._frame_lock:
             if not self._pending_frames:
@@ -547,6 +562,7 @@ class SerialAdapter:
                 return []
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
+            self._flush_queued_control(max_items=8)
 
         with self._frame_lock:
             frames = list(self._pending_frames)
@@ -682,23 +698,21 @@ class SerialAdapter:
                         "reason": "rate_limited",
                         "status": self.get_status(),
                     }
-                try:
-                    self.write_raw_line(line)
-                except Exception as exc:
-                    self._handle_serial_lost(exc)
+                dispatch = self._dispatch_control_payload("raw", line)
+                if not dispatch["ok"]:
                     self._record_control_rejected()
                     return {
                         "type": "control_ack",
                         "ok": False,
-                        "reason": "serial_unavailable",
+                        "reason": dispatch["reason"],
                         "status": self.get_status(),
                     }
-                self._record_control_accepted()
                 return {
                     "type": "control_ack",
                     "ok": True,
-                    "reason": "sent_raw",
+                    "reason": str(dispatch["reason"]),
                     "line": line,
+                    "queued_control_count": dispatch.get("queued_control_count"),
                     "status": self.get_status(),
                 }
 
@@ -712,23 +726,21 @@ class SerialAdapter:
                     "reason": "rate_limited",
                     "status": self.get_status(),
                 }
-            try:
-                self.write_raw_line(servo_line)
-            except Exception as exc:
-                self._handle_serial_lost(exc)
+            dispatch = self._dispatch_control_payload("raw", servo_line)
+            if not dispatch["ok"]:
                 self._record_control_rejected()
                 return {
                     "type": "control_ack",
                     "ok": False,
-                    "reason": "serial_unavailable",
+                    "reason": dispatch["reason"],
                     "status": self.get_status(),
                 }
-            self._record_control_accepted()
             return {
                 "type": "control_ack",
                 "ok": True,
-                "reason": "sent_raw",
+                "reason": str(dispatch["reason"]),
                 "line": servo_line,
+                "queued_control_count": dispatch.get("queued_control_count"),
                 "status": self.get_status(),
             }
 
@@ -748,25 +760,95 @@ class SerialAdapter:
                 "reason": "rate_limited",
                 "status": self.get_status(),
             }
-        try:
-            self.write(command)
-        except Exception as exc:
-            # Control path is best-effort.
-            self._handle_serial_lost(exc)
+        dispatch = self._dispatch_control_payload("json", command)
+        if not dispatch["ok"]:
             self._record_control_rejected()
             return {
                 "type": "control_ack",
                 "ok": False,
-                "reason": "serial_unavailable",
+                "reason": dispatch["reason"],
                 "status": self.get_status(),
             }
-        self._record_control_accepted()
         return {
             "type": "control_ack",
             "ok": True,
-            "reason": "sent",
+            "reason": str(dispatch["reason"]),
+            "queued_control_count": dispatch.get("queued_control_count"),
             "status": self.get_status(),
         }
+
+    def _dispatch_control_payload(self, mode: str, payload: Any) -> Dict[str, Any]:
+        if mode not in {"raw", "json"}:
+            raise ValueError(f"unsupported control mode: {mode}")
+
+        with self._serial_lock:
+            has_serial = self._serial is not None
+        if not has_serial and not self._maybe_reopen_serial():
+            return self._queue_control_payload(mode, payload)
+
+        try:
+            if mode == "raw":
+                self.write_raw_line(str(payload))
+                reason = "sent_raw"
+            else:
+                self.write(payload)
+                reason = "sent"
+            self._record_control_accepted()
+            return {"ok": True, "reason": reason}
+        except Exception as exc:
+            self._handle_serial_lost(exc)
+            queued = self._queue_control_payload(mode, payload)
+            if queued["ok"]:
+                return queued
+            return {"ok": False, "reason": "serial_unavailable"}
+
+    def _queue_control_payload(self, mode: str, payload: Any) -> Dict[str, Any]:
+        queued_payload: Any
+        if mode == "raw":
+            queued_payload = str(payload)
+        else:
+            if not isinstance(payload, dict):
+                return {"ok": False, "reason": "invalid_payload"}
+            queued_payload = copy.deepcopy(payload)
+
+        with self._queue_lock:
+            if len(self._queued_control) >= self._max_queued_control:
+                with self._status_lock:
+                    self._queued_control_dropped += 1
+                return {"ok": False, "reason": "queue_full"}
+            self._queued_control.append((mode, queued_payload))
+            queue_size = len(self._queued_control)
+        with self._status_lock:
+            self._control_commands_queued += 1
+        return {
+            "ok": True,
+            "reason": "queued",
+            "queued_control_count": queue_size,
+        }
+
+    def _flush_queued_control(self, max_items: int = 8) -> int:
+        if max_items <= 0:
+            return 0
+        sent = 0
+        while sent < max_items:
+            with self._queue_lock:
+                if not self._queued_control:
+                    break
+                mode, payload = self._queued_control[0]
+            try:
+                if mode == "raw":
+                    self.write_raw_line(str(payload))
+                else:
+                    self.write(payload)
+            except Exception as exc:
+                self._handle_serial_lost(exc)
+                break
+            with self._queue_lock:
+                if self._queued_control:
+                    self._queued_control.popleft()
+            self._record_control_accepted()
+            sent += 1
+        return sent
 
     def _handle_runtime_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         action = str(command.get(ADAPTER_CMD_KEY, "")).strip().lower()
@@ -887,6 +969,10 @@ class SerialAdapter:
             tx_rate = float(len(self._tx_timestamps))
             control_commands_accepted = int(self._control_commands_accepted)
             control_commands_rejected = int(self._control_commands_rejected)
+            control_commands_queued = int(self._control_commands_queued)
+            queued_control_dropped = int(self._queued_control_dropped)
+        with self._queue_lock:
+            queued_control_count = int(len(self._queued_control))
 
         with self._serial_lock:
             serial_connected = self._serial is not None
@@ -918,6 +1004,9 @@ class SerialAdapter:
             "ring_buffer_usage_ratio": self._ring_buffer.usage_ratio,
             "control_commands_accepted": control_commands_accepted,
             "control_commands_rejected": control_commands_rejected,
+            "control_commands_queued": control_commands_queued,
+            "queued_control_count": queued_control_count,
+            "queued_control_dropped": queued_control_dropped,
             "serial_connected": serial_connected,
             "serial_paused": serial_paused,
             "serial_pause_remaining_s": pause_remaining_s,

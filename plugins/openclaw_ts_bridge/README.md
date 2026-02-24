@@ -66,6 +66,12 @@ node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
 node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
 ```
 
+3) Optional: flash UNO with auto COM yield (pause -> upload -> resume):
+
+```bash
+node plugins/openclaw_ts_bridge/upload_with_pause.js --com COM3 --fqbn arduino:avr:uno --sketch C:\\path\\to\\sketch
+```
+
 Notes:
 - `servo_pos` uses MVP plain line protocol: `"<angle>\n"` (for example `90\n`).
 - Bridge writes incoming TCP bytes to UNO serial as-is.

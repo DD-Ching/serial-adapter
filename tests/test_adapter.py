@@ -338,6 +338,66 @@ def test_control_rate_limit_reset(rate_adapter):
 
 
 # ---------------------------------------------------------------------------
+# Control queue during COM contention/pause
+# ---------------------------------------------------------------------------
+
+
+def test_control_is_queued_while_serial_paused_and_flushed_after_resume():
+    adapter = SerialAdapter(
+        "mock",
+        9600,
+        enable_tcp=False,
+        unsafe_passthrough=True,
+        max_control_rate=10,
+        max_queued_control=8,
+    )
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    adapter.pause_serial(hold_s=0)
+
+    ack = adapter._handle_control_command({"custom_control": 1})  # type: ignore[attr-defined]
+    assert isinstance(ack, dict)
+    assert ack["ok"] is True
+    assert ack["reason"] == "queued"
+
+    status_before = adapter.get_status()
+    assert status_before["serial_paused"] is True
+    assert status_before["queued_control_count"] == 1
+    assert status_before["control_commands_queued"] >= 1
+
+    adapter.resume_serial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    flushed = adapter._flush_queued_control(max_items=8)  # type: ignore[attr-defined]
+    assert flushed >= 1
+    assert any(b'"custom_control":1' in item for item in fake.writes)
+
+    status_after = adapter.get_status()
+    assert status_after["serial_paused"] is False
+    assert status_after["queued_control_count"] == 0
+
+
+def test_control_queue_full_is_rejected():
+    adapter = SerialAdapter(
+        "mock",
+        9600,
+        enable_tcp=False,
+        unsafe_passthrough=True,
+        max_control_rate=10,
+        max_queued_control=1,
+    )
+    adapter.pause_serial(hold_s=0)
+
+    ack1 = adapter._handle_control_command({"custom_control": 1})  # type: ignore[attr-defined]
+    ack2 = adapter._handle_control_command({"custom_control": 2})  # type: ignore[attr-defined]
+    assert isinstance(ack1, dict) and ack1["ok"] is True and ack1["reason"] == "queued"
+    assert isinstance(ack2, dict) and ack2["ok"] is False and ack2["reason"] == "queue_full"
+
+    status = adapter.get_status()
+    assert status["queued_control_count"] == 1
+    assert status["queued_control_dropped"] >= 1
+
+
+# ---------------------------------------------------------------------------
 # Combined mode (separate fixture)
 # ---------------------------------------------------------------------------
 
