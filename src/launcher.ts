@@ -19,7 +19,25 @@ const DEFAULT_PORT_HINTS = [
   "com",
 ];
 
-const PKG_ROOT = resolve(import.meta.dirname, "..");
+function resolvePackageRoot(startDir: string): string {
+  const candidates = [
+    startDir,
+    resolve(startDir, ".."),
+    resolve(startDir, "..", ".."),
+    resolve(startDir, "..", "..", ".."),
+  ];
+  for (const dir of candidates) {
+    const marker = resolve(dir, "openclaw.plugin.json");
+    const pythonEntrypoint = resolve(dir, "python", "__main__.py");
+    if (existsSync(marker) && existsSync(pythonEntrypoint)) {
+      return dir;
+    }
+  }
+  return resolve(startDir, "..");
+}
+
+const PKG_ROOT = resolvePackageRoot(import.meta.dirname);
+const PYTHON_ENTRYPOINT = resolve(PKG_ROOT, "python", "__main__.py");
 const VENV_PYTHON = resolve(
   PKG_ROOT,
   ".venv",
@@ -364,14 +382,21 @@ export class PythonLauncher {
     ) {
       throw new Error(makePythonMissingMessage(pythonPath));
     }
+    if (!existsSync(PYTHON_ENTRYPOINT)) {
+      throw new Error(
+        [
+          `Python adapter entrypoint not found: ${PYTHON_ENTRYPOINT}`,
+          "Next step: reinstall the plugin or ensure python/__main__.py exists in the plugin package.",
+        ].join(" ")
+      );
+    }
     this.resolvedPort = launchPort;
 
     try {
       this.process = spawn(
         pythonPath,
         [
-          "-m",
-          "python",
+          PYTHON_ENTRYPOINT,
           "--port",
           launchPort,
           "--baudrate",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CLI entry point for the serial adapter subprocess.
 
-Launched by the TypeScript plugin via ``python3 -m python``.
+Launched by the TypeScript plugin via an absolute ``python/__main__.py`` path.
 Outputs a single JSON ready line to stdout, then blocks until SIGTERM/SIGINT.
 """
 
@@ -14,7 +14,13 @@ import signal
 import sys
 import threading
 
-from .plugin import SerialAdapter
+try:
+    from .plugin import SerialAdapter
+except ImportError:
+    # Allow direct script execution via absolute path:
+    #   python path/to/python/__main__.py ...
+    # This keeps startup robust even when module cwd/package context differs.
+    from plugin import SerialAdapter  # type: ignore[no-redef]
 
 _MISSING_DEPS_MSG = """\
 ERROR: Required Python package 'pyserial' is not installed.
