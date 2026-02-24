@@ -1,6 +1,6 @@
 [project]
 name = "serial-adapter"
-version = "0.3.0"
+version = "0.3.1"
 description = "Serial device telemetry adapter plugin for OpenClaw"
 requires-python = ">=3.10"
 dependencies = [

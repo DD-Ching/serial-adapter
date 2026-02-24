@@ -1,6 +1,6 @@
 {
   "name": "serial-adapter",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Serial device telemetry adapter plugin for OpenClaw",
   "license": "MIT",
   "author": "DD-Ching",
@@ -48,6 +48,11 @@
   },
   "peerDependencies": {
     "openclaw": "*"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "husky": "^9.1.7",
