@@ -2,7 +2,34 @@
   "name": "serial-adapter",
   "version": "0.3.0",
   "description": "Serial device telemetry adapter plugin for OpenClaw",
+  "license": "MIT",
+  "author": "DD-Ching",
+  "homepage": "https://github.com/DD-Ching/serial-adapter#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DD-Ching/serial-adapter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DD-Ching/serial-adapter/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "serial",
+    "telemetry",
+    "arduino",
+    "servo",
+    "mpu6050"
+  ],
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "test": "uv run pytest tests/ -x",
@@ -34,6 +61,5 @@
     "pyproject.toml",
     "uv.lock",
     "README.md"
-  ],
-  "license": "MIT"
+  ]
 }
