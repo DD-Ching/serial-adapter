@@ -242,10 +242,12 @@ Add to your OpenClaw config (`openclaw.json`):
 |---|---|
 | `serial_probe` | List detected serial ports and suggest the best candidate |
 | `serial_connect` | Connect to serial device and start adapter |
-| `serial_poll` | Read available telemetry frames |
+| `serial_quickcheck` | One-shot check: auto-connect (optional) + sample telemetry + IMU detection |
+| `serial_poll` | Read telemetry with compact summary (`includeFrames=true` for raw debug) |
 | `serial_send` | Send a control command to serial device |
+| `serial_stop` | Best-effort stop sequence with telemetry verification |
 | `serial_motion_template` | Run built-in servo motion templates |
-| `serial_status` | Get adapter runtime status |
+| `serial_status` | Get runtime status + recent telemetry snapshot summary |
 | `serial_pause` | Temporarily release COM for upload |
 | `serial_resume` | Re-open COM after upload |
 
@@ -253,9 +255,11 @@ Add to your OpenClaw config (`openclaw.json`):
 
 Use prompts like these with your OpenClaw agent:
 
-1. Connect and check status:
+1. Connect and detect IMU in one shot:
 ```text
-Call serial_probe first and pick the suggested port, then run serial_connect with baudrate 115200, then call serial_status.
+Run serial_quickcheck with observeMs 1500.
+If disconnected, autoConnect should be true.
+Return only summary and whether IMU (ax/ay/az or gx/gy/gz) is detected.
 ```
 
 2. Servo sweep test (visible frequency / PWM change):
@@ -270,14 +274,21 @@ After each step, call serial_poll and summarize latest telemetry.
 Use serial_send with command "90" (or "A90"), then call serial_status.
 ```
 
-3. Safe stop:
+3. Safe stop (verified):
 ```text
-Send a final command {"motor_pwm": 0}, then call serial_status.
+Call serial_stop with targetAngle 90 and verifyMs 1200.
+If verification.verified is false/null, report "command sent but not verified" (do not claim stopped).
 ```
 
 4. Run template motion directly:
 ```text
 Run serial_motion_template with template "slow_sway", repeats 2, intervalMs 400.
+```
+
+5. LLM behavior guard (avoid "ask-back loop"):
+```text
+When user asks "can you detect IMU now?", do not ask back.
+Call serial_quickcheck immediately and return diagnosis/next_step.
 ```
 
 ## Prototype Status

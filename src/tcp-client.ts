@@ -81,6 +81,19 @@ export class TelemetryClient {
     return result;
   }
 
+  snapshotFrames(count?: number): TelemetryFrame[] {
+    if (count === undefined) {
+      return this.frames.slice();
+    }
+    const safeCount = Math.max(0, Math.floor(count));
+    if (safeCount === 0) return [];
+    return this.frames.slice(-safeCount);
+  }
+
+  bufferedCount(): number {
+    return this.frames.length;
+  }
+
   disconnect(): void {
     this.rl?.close();
     this.rl = null;
