@@ -78,6 +78,13 @@ ADAPTER_CMD_RESUME = "resume"
 ADAPTER_CMD_STATUS = "status"
 ADAPTER_CMD_CAPABILITIES = "capabilities"
 
+CONTROL_META_SOURCE_ID = "source_id"
+CONTROL_META_PRIORITY = "priority"
+CONTROL_META_LEASE_MS = "lease_ms"
+DEFAULT_CONTROL_LEASE_MS = 5000
+MIN_CONTROL_LEASE_MS = 200
+MAX_CONTROL_LEASE_MS = 120000
+
 
 class SerialAdapter:
     """Universal Telemetry Adapter v3: serial transport + TCP observer transport."""
@@ -117,6 +124,9 @@ class SerialAdapter:
         self._control_commands_rejected = 0
         self._control_commands_queued = 0
         self._queued_control_dropped = 0
+        self._control_lease_owner: Optional[str] = None
+        self._control_lease_priority = 0
+        self._control_lease_expires_monotonic = 0.0
 
         self._serial: Optional[Any] = None
         self._serial_reopen_interval_s = float(DEFAULT_REOPEN_INTERVAL_S)
@@ -189,6 +199,9 @@ class SerialAdapter:
         self._pause_until_monotonic = None
         with self._control_lock:
             self._control_timestamps.clear()
+            self._control_lease_owner = None
+            self._control_lease_priority = 0
+            self._control_lease_expires_monotonic = 0.0
         with self._status_lock:
             self._rx_timestamps.clear()
             self._tx_timestamps.clear()
@@ -658,6 +671,111 @@ class SerialAdapter:
             return None
         return str(angle)
 
+    def _normalize_source_id(self, value: Any) -> Optional[str]:
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            return None
+        if len(text) > 64:
+            return text[:64]
+        return text
+
+    def _normalize_priority(self, value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+            return max(-100, min(parsed, 100))
+        return 0
+
+    def _normalize_lease_ms(self, value: Any) -> int:
+        if isinstance(value, bool):
+            return DEFAULT_CONTROL_LEASE_MS
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        else:
+            return DEFAULT_CONTROL_LEASE_MS
+        return max(MIN_CONTROL_LEASE_MS, min(parsed, MAX_CONTROL_LEASE_MS))
+
+    def _strip_control_metadata(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned = dict(command)
+        cleaned.pop(CONTROL_META_SOURCE_ID, None)
+        cleaned.pop(CONTROL_META_PRIORITY, None)
+        cleaned.pop(CONTROL_META_LEASE_MS, None)
+        return cleaned
+
+    def _expire_control_lease_locked(self, now: float) -> None:
+        if self._control_lease_owner is None:
+            return
+        if now < self._control_lease_expires_monotonic:
+            return
+        self._control_lease_owner = None
+        self._control_lease_priority = 0
+        self._control_lease_expires_monotonic = 0.0
+
+    def _authorize_control_source(
+        self, command: Dict[str, Any]
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        source_id = self._normalize_source_id(command.get(CONTROL_META_SOURCE_ID))
+        priority = self._normalize_priority(command.get(CONTROL_META_PRIORITY))
+        lease_ms = self._normalize_lease_ms(command.get(CONTROL_META_LEASE_MS))
+        now = time.monotonic()
+
+        with self._control_lock:
+            self._expire_control_lease_locked(now)
+            current_owner = self._control_lease_owner
+            current_priority = self._control_lease_priority
+            current_expires = self._control_lease_expires_monotonic
+
+            if source_id is None:
+                if current_owner is None:
+                    return True, "no_source", {
+                        "owner": None,
+                        "priority": 0,
+                        "remaining_s": None,
+                    }
+                return False, "lease_held_by_other", {
+                    "owner": current_owner,
+                    "priority": current_priority,
+                    "remaining_s": max(0.0, current_expires - now),
+                }
+
+            if current_owner is None:
+                self._control_lease_owner = source_id
+                self._control_lease_priority = priority
+                self._control_lease_expires_monotonic = now + (lease_ms / 1000.0)
+                return True, "lease_acquired", {
+                    "owner": source_id,
+                    "priority": priority,
+                    "remaining_s": lease_ms / 1000.0,
+                }
+
+            if current_owner == source_id:
+                # Same source refreshes lease.
+                self._control_lease_priority = max(current_priority, priority)
+                self._control_lease_expires_monotonic = now + (lease_ms / 1000.0)
+                return True, "lease_refreshed", {
+                    "owner": source_id,
+                    "priority": self._control_lease_priority,
+                    "remaining_s": lease_ms / 1000.0,
+                }
+
+            if priority > current_priority:
+                # Higher priority source can preempt.
+                self._control_lease_owner = source_id
+                self._control_lease_priority = priority
+                self._control_lease_expires_monotonic = now + (lease_ms / 1000.0)
+                return True, "lease_preempted", {
+                    "owner": source_id,
+                    "priority": priority,
+                    "remaining_s": lease_ms / 1000.0,
+                }
+
+            return False, "lease_held_by_other", {
+                "owner": current_owner,
+                "priority": current_priority,
+                "remaining_s": max(0.0, current_expires - now),
+            }
+
     def _convert_servo_alias_to_raw_line(
         self, command: Dict[str, Any]
     ) -> Optional[str]:
@@ -678,17 +796,30 @@ class SerialAdapter:
         if isinstance(runtime_cmd, str) and runtime_cmd.strip():
             return self._handle_runtime_command(command)
 
-        cmd = command.get("cmd")
+        normalized_command = self._strip_control_metadata(command)
+        lease_ok, lease_reason, lease_info = self._authorize_control_source(command)
+        if not lease_ok:
+            self._record_control_rejected()
+            return {
+                "type": "control_ack",
+                "ok": False,
+                "reason": lease_reason,
+                "lease": lease_info,
+                "status": self.get_status(),
+            }
+
+        cmd = normalized_command.get("cmd")
         if isinstance(cmd, str):
             cmd_name = cmd.strip().lower()
             if cmd_name in {"raw_line", "serial_raw", "raw"}:
-                line = self._normalize_raw_control_line(command.get("line"))
+                line = self._normalize_raw_control_line(normalized_command.get("line"))
                 if line is None:
                     self._record_control_rejected()
                     return {
                         "type": "control_ack",
                         "ok": False,
                         "reason": "invalid_raw_line",
+                        "lease": lease_info,
                         "status": self.get_status(),
                     }
                 if not self._consume_control_rate_slot():
@@ -697,6 +828,7 @@ class SerialAdapter:
                         "type": "control_ack",
                         "ok": False,
                         "reason": "rate_limited",
+                        "lease": lease_info,
                         "status": self.get_status(),
                     }
                 dispatch = self._dispatch_control_payload("raw", line)
@@ -706,6 +838,7 @@ class SerialAdapter:
                         "type": "control_ack",
                         "ok": False,
                         "reason": dispatch["reason"],
+                        "lease": lease_info,
                         "status": self.get_status(),
                     }
                 return {
@@ -713,11 +846,12 @@ class SerialAdapter:
                     "ok": True,
                     "reason": str(dispatch["reason"]),
                     "line": line,
+                    "lease": lease_info,
                     "queued_control_count": dispatch.get("queued_control_count"),
                     "status": self.get_status(),
                 }
 
-        servo_line = self._convert_servo_alias_to_raw_line(command)
+        servo_line = self._convert_servo_alias_to_raw_line(normalized_command)
         if servo_line is not None:
             if not self._consume_control_rate_slot():
                 self._record_control_rejected()
@@ -725,6 +859,7 @@ class SerialAdapter:
                     "type": "control_ack",
                     "ok": False,
                     "reason": "rate_limited",
+                    "lease": lease_info,
                     "status": self.get_status(),
                 }
             dispatch = self._dispatch_control_payload("raw", servo_line)
@@ -734,6 +869,7 @@ class SerialAdapter:
                     "type": "control_ack",
                     "ok": False,
                     "reason": dispatch["reason"],
+                    "lease": lease_info,
                     "status": self.get_status(),
                 }
             return {
@@ -741,16 +877,18 @@ class SerialAdapter:
                 "ok": True,
                 "reason": str(dispatch["reason"]),
                 "line": servo_line,
+                "lease": lease_info,
                 "queued_control_count": dispatch.get("queued_control_count"),
                 "status": self.get_status(),
             }
 
-        if not self._is_control_command_allowed(command):
+        if not self._is_control_command_allowed(normalized_command):
             self._record_control_rejected()
             return {
                 "type": "control_ack",
                 "ok": False,
                 "reason": "not_allowlisted",
+                "lease": lease_info,
                 "status": self.get_status(),
             }
         if not self._consume_control_rate_slot():
@@ -759,21 +897,24 @@ class SerialAdapter:
                 "type": "control_ack",
                 "ok": False,
                 "reason": "rate_limited",
+                "lease": lease_info,
                 "status": self.get_status(),
             }
-        dispatch = self._dispatch_control_payload("json", command)
+        dispatch = self._dispatch_control_payload("json", normalized_command)
         if not dispatch["ok"]:
             self._record_control_rejected()
             return {
                 "type": "control_ack",
                 "ok": False,
                 "reason": dispatch["reason"],
+                "lease": lease_info,
                 "status": self.get_status(),
             }
         return {
             "type": "control_ack",
             "ok": True,
             "reason": str(dispatch["reason"]),
+            "lease": lease_info,
             "queued_control_count": dispatch.get("queued_control_count"),
             "status": self.get_status(),
         }
@@ -981,6 +1122,11 @@ class SerialAdapter:
             control_commands_rejected = int(self._control_commands_rejected)
             control_commands_queued = int(self._control_commands_queued)
             queued_control_dropped = int(self._queued_control_dropped)
+        with self._control_lock:
+            self._expire_control_lease_locked(now)
+            lease_owner = self._control_lease_owner
+            lease_priority = int(self._control_lease_priority)
+            lease_expires = float(self._control_lease_expires_monotonic)
         with self._queue_lock:
             queued_control_count = int(len(self._queued_control))
 
@@ -997,6 +1143,12 @@ class SerialAdapter:
             pause_remaining_s = max(0.0, pause_until - now)
         else:
             pause_remaining_s = None
+
+        lease_remaining_s: Optional[float]
+        if lease_owner is not None:
+            lease_remaining_s = max(0.0, lease_expires - now)
+        else:
+            lease_remaining_s = None
 
         if self._compat_server is not None:
             connected_clients = self._compat_server.get_client_count()
@@ -1024,6 +1176,12 @@ class SerialAdapter:
             "serial_last_error": serial_last_error,
             "serial_port": self._port,
             "serial_baudrate": int(self._baudrate),
+            "control_lease": {
+                "owner": lease_owner,
+                "priority": lease_priority,
+                "remaining_s": lease_remaining_s,
+                "active": lease_owner is not None,
+            },
             "degraded": (not serial_connected) or serial_paused,
         }
 
@@ -1071,6 +1229,20 @@ class SerialAdapter:
                 "unsafe_passthrough": bool(self._unsafe_passthrough),
                 "allowlist_enabled": not bool(self._unsafe_passthrough),
                 "allowed_commands": sorted(self._allowed_commands),
+                "source_arbitration": {
+                    "metadata_keys": [
+                        CONTROL_META_SOURCE_ID,
+                        CONTROL_META_PRIORITY,
+                        CONTROL_META_LEASE_MS,
+                    ],
+                    "default_lease_ms": int(DEFAULT_CONTROL_LEASE_MS),
+                    "max_lease_ms": int(MAX_CONTROL_LEASE_MS),
+                    "priority_range": [-100, 100],
+                    "behavior": (
+                        "Commands with source_id acquire/refresh lease;"
+                        " higher priority can preempt; anonymous commands are blocked while lease is active."
+                    ),
+                },
                 "raw_line_protocol": {
                     "angle": "A<0..180> or <0..180>",
                     "pulse": "P<500..2500>",

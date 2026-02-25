@@ -16,6 +16,7 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 - Auto serial-port probing with best-effort UNO/USB-serial matching
 - Self-healing bridge sync (`serial_bridge_sync`) for auto-connect + auto-resume flows
 - Sticky bridge session semantics: tools reuse the same live bridge session instead of restarting on every command
+- Multi-source control arbitration lease (`source_id` + `priority` + `lease_ms`) to avoid command collisions
 - Observer API (`poll`, `poll_all`, `register_callback`, `get_latest_frame`, `get_last_n_frames`)
 - Control safety enforcement (`unsafe_passthrough`, allowlist, rate limiting)
 - Built-in motion templates (`slow_sway`, `fast_jitter`, `sweep`, `center_stop`)
@@ -357,6 +358,26 @@ serial_stop(targetAngle=90, verifyMs=1200)
 - Keep `unsafePassthrough` as `false` unless you explicitly need unrestricted control keys.
 - Use `allowedCommands` to limit accepted control keys.
 - Keep a conservative `maxControlRate` for initial hardware tests.
+
+## Multi-Source Control Arbitration
+
+Control commands may include optional metadata:
+
+- `source_id`: logical command source (for example `serial_intent`, `telegram_agent`, `manual_debug`)
+- `priority`: `-100..100` (higher source can preempt lower source lease)
+- `lease_ms`: lease duration (`200..120000`)
+
+Behavior:
+
+- Commands with `source_id` acquire/refresh a control lease.
+- Anonymous commands (without `source_id`) are blocked while another lease is active.
+- Higher-priority sources can preempt lower-priority sources.
+
+Current tool defaults:
+
+- `serial_intent` uses `source_id=serial_intent` by default.
+- `serial_stop` and `serial_motion_template` also attach a default source lease.
+- `serial_send` supports optional `sourceId/priority/leaseMs` when you need explicit ownership.
 
 ## Development
 

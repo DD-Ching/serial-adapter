@@ -40,6 +40,7 @@ const DEFAULT_OBSERVE_MS = 1200;
 const DEFAULT_OBSERVE_MAX_FRAMES = 80;
 const STOP_TARGET_DEFAULT = 90;
 const DEFAULT_SEMANTIC_VERIFY_MS = 1000;
+const DEFAULT_SEMANTIC_SOURCE_ID = "serial_intent";
 const DEFAULT_ACK_TIMEOUT_MS = 1200;
 const DEFAULT_TOOL_AUTO_CONNECT = true;
 const DEFAULT_AUTO_RESUME_ON_USE = true;
@@ -698,10 +699,90 @@ function pwmToApproxAngle(pwm: number): number {
   return normalized;
 }
 
+interface ControlSourceContext {
+  sourceId?: string;
+  priority?: number;
+  leaseMs?: number;
+}
+
+function toControlSourceContext(
+  params: { sourceId?: unknown; priority?: unknown; leaseMs?: unknown },
+  defaults?: ControlSourceContext
+): ControlSourceContext | undefined {
+  const sourceId =
+    typeof params.sourceId === "string" && params.sourceId.trim().length > 0
+      ? params.sourceId.trim()
+      : defaults?.sourceId;
+  const priority =
+    typeof params.priority === "number" && Number.isFinite(params.priority)
+      ? params.priority
+      : defaults?.priority;
+  const leaseMs =
+    typeof params.leaseMs === "number" && Number.isFinite(params.leaseMs)
+      ? params.leaseMs
+      : defaults?.leaseMs;
+
+  if (
+    typeof sourceId !== "string" &&
+    typeof priority !== "number" &&
+    typeof leaseMs !== "number"
+  ) {
+    return undefined;
+  }
+
+  return { sourceId, priority, leaseMs };
+}
+
+function buildControlSourceMeta(
+  context?: ControlSourceContext
+): Record<string, unknown> {
+  const meta: Record<string, unknown> = {};
+  const sourceId = context?.sourceId?.trim();
+  if (sourceId) meta.source_id = sourceId.slice(0, 64);
+  if (typeof context?.priority === "number" && Number.isFinite(context.priority)) {
+    meta.priority = clamp(Math.floor(context.priority), -100, 100);
+  }
+  if (typeof context?.leaseMs === "number" && Number.isFinite(context.leaseMs)) {
+    meta.lease_ms = clamp(Math.floor(context.leaseMs), 200, 120000);
+  }
+  return meta;
+}
+
+function sendManagedRawLine(line: string, context?: ControlSourceContext): void {
+  if (!controlClient) {
+    throw new Error("Not connected. Call serial_connect first.");
+  }
+  const meta = buildControlSourceMeta(context);
+  if (Object.keys(meta).length === 0) {
+    controlClient.sendRawLine(line);
+    return;
+  }
+  controlClient.sendCommand({
+    cmd: "raw_line",
+    line,
+    ...meta,
+  });
+}
+
+function sendManagedJsonCommand(
+  payload: Record<string, unknown>,
+  context?: ControlSourceContext
+): void {
+  if (!controlClient) {
+    throw new Error("Not connected. Call serial_connect first.");
+  }
+  const meta = buildControlSourceMeta(context);
+  controlClient.sendCommand({
+    ...payload,
+    ...meta,
+  });
+}
+
 async function sendBestEffortStopSequence(options: {
   targetAngle: number;
   repeats: number;
   intervalMs: number;
+  source?: ControlSourceContext;
 }): Promise<void> {
   if (!controlClient) {
     throw new Error("Not connected. Call serial_connect first.");
@@ -712,25 +793,28 @@ async function sendBestEffortStopSequence(options: {
 
   for (let i = 0; i < repeats; i += 1) {
     // Stop keywords for firmware that implements explicit stop/sweep toggles.
-    controlClient.sendRawLine("STOP");
-    controlClient.sendRawLine("SWEEP_OFF");
+    sendManagedRawLine("STOP", options.source);
+    sendManagedRawLine("SWEEP_OFF", options.source);
     // Send both plain angle and A<angle> to cover common UNO parser variants.
-    controlClient.sendRawLine(String(targetAngle));
-    controlClient.sendRawLine(`A${targetAngle}`);
-    controlClient.sendCommand({ motor_pwm: 0 });
-    controlClient.sendCommand({ target_velocity: 0 });
+    sendManagedRawLine(String(targetAngle), options.source);
+    sendManagedRawLine(`A${targetAngle}`, options.source);
+    sendManagedJsonCommand({ motor_pwm: 0 }, options.source);
+    sendManagedJsonCommand({ target_velocity: 0 }, options.source);
     await sleep(intervalMs);
   }
 }
 
-async function sendServoAngleBestEffort(targetAngle: number): Promise<void> {
+async function sendServoAngleBestEffort(
+  targetAngle: number,
+  source?: ControlSourceContext
+): Promise<void> {
   if (!controlClient) {
     throw new Error("Not connected. Call serial_connect first.");
   }
   const clamped = clamp(Math.round(targetAngle), 0, 180);
-  controlClient.sendRawLine(String(clamped));
+  sendManagedRawLine(String(clamped), source);
   await sleep(20);
-  controlClient.sendRawLine(`A${clamped}`);
+  sendManagedRawLine(`A${clamped}`, source);
 }
 
 function evaluateStopVerification(
@@ -793,6 +877,7 @@ async function executeSemanticIntent(options: {
   delta?: number;
   targetAngle?: number;
   includeFrames?: boolean;
+  source?: ControlSourceContext;
 }): Promise<Record<string, unknown>> {
   const text = normalizeIntentText(options.instruction);
   const intent = detectSemanticIntent(text);
@@ -829,6 +914,7 @@ async function executeSemanticIntent(options: {
       targetAngle: STOP_TARGET_DEFAULT,
       repeats: 2,
       intervalMs: 120,
+      source: options.source,
     });
     const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
     const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
@@ -846,7 +932,7 @@ async function executeSemanticIntent(options: {
 
   if (intent === "center") {
     const target = parseAbsoluteAngle(text, options.targetAngle) ?? STOP_TARGET_DEFAULT;
-    await sendServoAngleBestEffort(target);
+    await sendServoAngleBestEffort(target, options.source);
     const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
     const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
     const verification = evaluateStopVerification(frames, target);
@@ -870,7 +956,7 @@ async function executeSemanticIntent(options: {
     const target =
       absoluteOverride !== null ? absoluteOverride : clamp(current + sign * delta, 0, 180);
 
-    await sendServoAngleBestEffort(target);
+    await sendServoAngleBestEffort(target, options.source);
     const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
     const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
     const verification = evaluateStopVerification(frames, target);
@@ -891,7 +977,7 @@ async function executeSemanticIntent(options: {
   const sequence =
     intent === "nod" ? [90, 75, 100, 80, 90] : [90, 70, 110, 75, 105, 90];
   for (const angle of sequence) {
-    await sendServoAngleBestEffort(angle);
+    await sendServoAngleBestEffort(angle, options.source);
     await sleep(180);
   }
   const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
@@ -1169,6 +1255,30 @@ const plugin = {
             description: "Include sampled frames for debug mode.",
           })
         ),
+        sourceId: Type.Optional(
+          Type.String({
+            description:
+              "Optional control source id for arbitration lease. Default: serial_intent.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        priority: Type.Optional(
+          Type.Number({
+            description:
+              "Optional arbitration priority (-100..100). Higher can preempt lower priority owners.",
+            minimum: -100,
+            maximum: 100,
+          })
+        ),
+        leaseMs: Type.Optional(
+          Type.Number({
+            description:
+              "Optional lease time in ms for this source ownership (200..120000).",
+            minimum: 200,
+            maximum: 120000,
+          })
+        ),
       }),
       async execute(_toolCallId, params) {
         const bridge = await ensureBridgeReady(config, {
@@ -1189,17 +1299,36 @@ const plugin = {
           });
         }
 
+        const resolvedVerifyMs =
+          typeof params.verifyMs === "number" && Number.isFinite(params.verifyMs)
+            ? Math.max(300, Math.min(Math.floor(params.verifyMs), 8000))
+            : DEFAULT_SEMANTIC_VERIFY_MS;
+        const source = toControlSourceContext(
+          {
+            sourceId: params.sourceId,
+            priority: params.priority,
+            leaseMs: params.leaseMs,
+          },
+          {
+            sourceId: DEFAULT_SEMANTIC_SOURCE_ID,
+            priority: 20,
+            leaseMs: resolvedVerifyMs + 1500,
+          }
+        );
+
         const result = await executeSemanticIntent({
           instruction: params.instruction,
-          verifyMs: params.verifyMs,
+          verifyMs: resolvedVerifyMs,
           intensity: params.intensity as SemanticIntensity | undefined,
           delta: params.delta,
           targetAngle: params.targetAngle,
           includeFrames: params.includeFrames,
+          source,
         });
 
         return jsonResult({
           ...result,
+          control_source: buildControlSourceMeta(source),
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,
@@ -1407,6 +1536,30 @@ const plugin = {
           description:
             "Control payload. Supports JSON object or shorthand text (A90/P1500/90).",
         }),
+        sourceId: Type.Optional(
+          Type.String({
+            description:
+              "Optional control source id used for runtime arbitration lease.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        priority: Type.Optional(
+          Type.Number({
+            description:
+              "Optional arbitration priority (-100..100). Higher can preempt lower priority owners.",
+            minimum: -100,
+            maximum: 100,
+          })
+        ),
+        leaseMs: Type.Optional(
+          Type.Number({
+            description:
+              "Optional lease time in ms for this source ownership (200..120000).",
+            minimum: 200,
+            maximum: 120000,
+          })
+        ),
       }),
       async execute(_toolCallId, params) {
         const bridge = await ensureBridgeReady(config, {
@@ -1427,10 +1580,16 @@ const plugin = {
           });
         }
 
+        const source = toControlSourceContext({
+          sourceId: params.sourceId,
+          priority: params.priority,
+          leaseMs: params.leaseMs,
+        });
+
         if (normalized.mode === "json") {
-          controlClient.sendCommand(normalized.payload);
+          sendManagedJsonCommand(normalized.payload, source);
         } else {
-          controlClient.sendRawLine(normalized.payload);
+          sendManagedRawLine(normalized.payload, source);
         }
 
         return jsonResult({
@@ -1438,6 +1597,7 @@ const plugin = {
           mode: normalized.mode,
           source: normalized.source,
           normalized: normalized.payload,
+          control_source: buildControlSourceMeta(source),
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,
@@ -1481,6 +1641,30 @@ const plugin = {
         includeFrames: Type.Optional(
           Type.Boolean({ description: "Include verification frames for debug." })
         ),
+        sourceId: Type.Optional(
+          Type.String({
+            description:
+              "Optional control source id used for runtime arbitration lease.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        priority: Type.Optional(
+          Type.Number({
+            description:
+              "Optional arbitration priority (-100..100). Higher can preempt lower priority owners.",
+            minimum: -100,
+            maximum: 100,
+          })
+        ),
+        leaseMs: Type.Optional(
+          Type.Number({
+            description:
+              "Optional lease time in ms for this source ownership (200..120000).",
+            minimum: 200,
+            maximum: 120000,
+          })
+        ),
       }),
       async execute(_toolCallId, params) {
         const bridge = await ensureBridgeReady(config, {
@@ -1511,12 +1695,25 @@ const plugin = {
             ? Math.max(200, Math.min(Math.floor(params.verifyMs), 8000))
             : DEFAULT_OBSERVE_MS;
         const includeFrames = params.includeFrames === true;
+        const source = toControlSourceContext(
+          {
+            sourceId: params.sourceId,
+            priority: params.priority,
+            leaseMs: params.leaseMs,
+          },
+          {
+            sourceId: "serial_stop",
+            priority: 30,
+            leaseMs: verifyMs + repeats * intervalMs + 1200,
+          }
+        );
 
         try {
           await sendBestEffortStopSequence({
             targetAngle,
             repeats,
             intervalMs,
+            source,
           });
         } catch (error) {
           return jsonResult({
@@ -1537,6 +1734,7 @@ const plugin = {
           repeats,
           interval_ms: intervalMs,
           verify_ms: verifyMs,
+          control_source: buildControlSourceMeta(source),
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,
@@ -1591,6 +1789,30 @@ const plugin = {
         centerPwm: Type.Optional(
           Type.Number({ description: "Center PWM", minimum: 500, maximum: 2500 })
         ),
+        sourceId: Type.Optional(
+          Type.String({
+            description:
+              "Optional control source id used for runtime arbitration lease.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        priority: Type.Optional(
+          Type.Number({
+            description:
+              "Optional arbitration priority (-100..100). Higher can preempt lower priority owners.",
+            minimum: -100,
+            maximum: 100,
+          })
+        ),
+        leaseMs: Type.Optional(
+          Type.Number({
+            description:
+              "Optional lease time in ms for this source ownership (200..120000).",
+            minimum: 200,
+            maximum: 120000,
+          })
+        ),
       }),
       async execute(_toolCallId, params) {
         const bridge = await ensureBridgeReady(config, {
@@ -1612,6 +1834,18 @@ const plugin = {
           maxPwm: params.maxPwm ?? 1900,
           centerPwm: params.centerPwm ?? 1500,
         });
+        const source = toControlSourceContext(
+          {
+            sourceId: params.sourceId,
+            priority: params.priority,
+            leaseMs: params.leaseMs,
+          },
+          {
+            sourceId: "serial_motion_template",
+            priority: 15,
+            leaseMs: intervalMs * Math.max(1, sequence.length * repeats) + 1200,
+          }
+        );
 
         if (template === "center_stop") {
           const targetAngle = pwmToApproxAngle(params.centerPwm ?? 1500);
@@ -1619,6 +1853,7 @@ const plugin = {
             targetAngle,
             repeats,
             intervalMs,
+            source,
           });
           const frames = await collectTelemetryFrames(
             Math.max(400, Math.min(2000, intervalMs * repeats + 600)),
@@ -1633,6 +1868,7 @@ const plugin = {
             intervalMs,
             sequence,
             totalCommands: sequence.length * repeats,
+            control_source: buildControlSourceMeta(source),
             bridge: {
               auto_connected: bridge.auto_connected,
               resumed: bridge.resumed,
@@ -1650,7 +1886,7 @@ const plugin = {
 
         for (let r = 0; r < repeats; r += 1) {
           for (const pwm of sequence) {
-            controlClient.sendCommand({ motor_pwm: pwm });
+            sendManagedJsonCommand({ motor_pwm: pwm }, source);
             await sleep(intervalMs);
           }
         }
@@ -1662,6 +1898,7 @@ const plugin = {
           intervalMs,
           sequence,
           totalCommands: sequence.length * repeats,
+          control_source: buildControlSourceMeta(source),
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,
