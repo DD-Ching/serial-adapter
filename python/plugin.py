@@ -94,6 +94,7 @@ AUTO_PROBE_SEQUENCE: tuple[str, ...] = (
 )
 AUTO_PROBE_IDLE_INTERVAL_S = 1.5
 AUTO_PROBE_MIN_GAP_S = 0.35
+AUTO_PROBE_MAX_BACKOFF_S = 30.0
 
 
 class SerialAdapter:
@@ -143,6 +144,8 @@ class SerialAdapter:
         self._last_probe_reason: Optional[str] = None
         self._probe_sent_count = 0
         self._next_probe_index = 0
+        self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
+        self._auto_probe_fail_streak = 0
 
         self._serial: Optional[Any] = None
         self._serial_reopen_interval_s = float(DEFAULT_REOPEN_INTERVAL_S)
@@ -231,6 +234,8 @@ class SerialAdapter:
             self._last_probe_reason = None
             self._probe_sent_count = 0
             self._next_probe_index = 0
+            self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
+            self._auto_probe_fail_streak = 0
         with self._queue_lock:
             self._queued_control.clear()
         with self._frame_lock:
@@ -350,12 +355,21 @@ class SerialAdapter:
         if force:
             return True
         now = time.monotonic()
+        with self._control_lock:
+            self._expire_control_lease_locked(now)
+            if self._control_lease_owner is not None:
+                # Do not inject probe traffic while an external control source holds the lane.
+                return False
         with self._status_lock:
             if now - self._last_probe_monotonic < AUTO_PROBE_MIN_GAP_S:
                 return False
+            idle_threshold = max(
+                float(AUTO_PROBE_IDLE_INTERVAL_S),
+                float(self._auto_probe_backoff_s),
+            )
             if self._last_rx_monotonic <= 0.0:
                 return True
-            return (now - self._last_rx_monotonic) >= AUTO_PROBE_IDLE_INTERVAL_S
+            return (now - self._last_rx_monotonic) >= idle_threshold
 
     def _send_next_auto_probe(self, *, reason: str, force: bool = False) -> bool:
         if not AUTO_PROBE_SEQUENCE:
@@ -381,6 +395,19 @@ class SerialAdapter:
             self._last_probe_line = line
             self._last_probe_reason = str(reason)
             self._probe_sent_count += 1
+            if reason == "idle":
+                self._auto_probe_fail_streak = min(
+                    int(self._auto_probe_fail_streak) + 1, 16
+                )
+                self._auto_probe_backoff_s = min(
+                    float(AUTO_PROBE_MAX_BACKOFF_S),
+                    float(AUTO_PROBE_IDLE_INTERVAL_S)
+                    * (2.0 ** float(self._auto_probe_fail_streak)),
+                )
+            else:
+                # Connect/reopen/manual probes reset backoff window.
+                self._auto_probe_fail_streak = 0
+                self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
         return True
 
     def connect(self) -> bool:
@@ -1135,6 +1162,8 @@ class SerialAdapter:
             self._rx_timestamps.append(now)
             self._prune_timestamps_locked(self._rx_timestamps, now)
             self._last_rx_monotonic = now
+            self._auto_probe_fail_streak = 0
+            self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
 
     def _record_control_accepted(self) -> None:
         now = time.monotonic()
@@ -1191,6 +1220,8 @@ class SerialAdapter:
             last_probe_line = self._last_probe_line
             last_probe_reason = self._last_probe_reason
             probe_sent_count = int(self._probe_sent_count)
+            auto_probe_backoff_s = float(self._auto_probe_backoff_s)
+            auto_probe_fail_streak = int(self._auto_probe_fail_streak)
         with self._control_lock:
             self._expire_control_lease_locked(now)
             lease_owner = self._control_lease_owner
@@ -1263,6 +1294,8 @@ class SerialAdapter:
                 "last_line": last_probe_line,
                 "last_reason": last_probe_reason,
                 "last_sent_s_ago": probe_last_sent_s_ago,
+                "backoff_s": auto_probe_backoff_s,
+                "fail_streak": auto_probe_fail_streak,
             },
             "control_lease": {
                 "owner": lease_owner,
@@ -1317,6 +1350,7 @@ class SerialAdapter:
                     "sequence": list(AUTO_PROBE_SEQUENCE),
                     "idle_interval_s": float(AUTO_PROBE_IDLE_INTERVAL_S),
                     "min_gap_s": float(AUTO_PROBE_MIN_GAP_S),
+                    "max_backoff_s": float(AUTO_PROBE_MAX_BACKOFF_S),
                     "purpose": "wake telemetry streaming firmware and reduce manual retries",
                 },
             },

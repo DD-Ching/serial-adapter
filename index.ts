@@ -1554,13 +1554,37 @@ const plugin = {
             leaseMs: observeMs + 1500,
           }
         );
+        const runtimeStatus = asRecord(bridge.runtime_status);
+        const telemetryLastRxSAgo = asFiniteNumber(
+          runtimeStatus?.telemetry_last_rx_s_ago
+        );
+        const runtimeAutoProbe = asRecord(runtimeStatus?.auto_probe);
+        const runtimeLastAutoProbeSAgo = asFiniteNumber(
+          runtimeAutoProbe?.last_sent_s_ago
+        );
+        const probeRequested = params.triggerProbe !== false;
+        let probePerformed = false;
+        let probeReason = "disabled_by_param";
+        let probeError: string | null = null;
         let driveAction: Record<string, unknown> | null = null;
 
-        if (params.triggerProbe !== false) {
-          try {
-            await sendProbeBurst({ source, spacingMs: 60 });
-          } catch {
-            // Probe is best-effort only.
+        if (probeRequested) {
+          if (telemetryLastRxSAgo !== null && telemetryLastRxSAgo <= 1.2) {
+            probeReason = "skipped_recent_telemetry";
+          } else if (
+            runtimeLastAutoProbeSAgo !== null &&
+            runtimeLastAutoProbeSAgo <= 0.9
+          ) {
+            probeReason = "skipped_recent_runtime_probe";
+          } else {
+            try {
+              await sendProbeBurst({ source, spacingMs: 60 });
+              probePerformed = true;
+              probeReason = "sent";
+            } catch (error) {
+              probeReason = "send_failed";
+              probeError = toErrorMessage(error);
+            }
           }
         }
 
@@ -1588,6 +1612,14 @@ const plugin = {
           observe_ms: observeMs,
           sampled_frames: frames.length,
           summary,
+          probe: {
+            requested: probeRequested,
+            performed: probePerformed,
+            reason: probeReason,
+            error: probeError,
+            telemetry_last_rx_s_ago: telemetryLastRxSAgo,
+            runtime_last_probe_s_ago: runtimeLastAutoProbeSAgo,
+          },
           drive_action: driveAction,
           control_source: buildControlSourceMeta(source),
           bridge: {

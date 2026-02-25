@@ -18,6 +18,7 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 - Sticky bridge session semantics: tools reuse the same live bridge session instead of restarting on every command
 - Multi-source control arbitration lease (`source_id` + `priority` + `lease_ms`) to avoid command collisions
 - Runtime auto-probe handshake (`STATUS?`, `IMU_ON`, `TELEMETRY_ON`, `STREAM_ON`, `IMU?`) to reduce “connected but no telemetry” loops
+- Smart probe suppression: when telemetry is already flowing, `serial_quickcheck` skips redundant handshake bursts
 - Observer API (`poll`, `poll_all`, `register_callback`, `get_latest_frame`, `get_last_n_frames`)
 - Control safety enforcement (`unsafe_passthrough`, allowlist, rate limiting)
 - Built-in motion templates (`slow_sway`, `fast_jitter`, `sweep`, `center_stop`)
@@ -398,6 +399,13 @@ Current tool defaults:
 - `serial_stop` and `serial_motion_template` also attach a default source lease.
 - `serial_send` supports optional `sourceId/priority/leaseMs` when you need explicit ownership.
 - `serial_quickcheck` also supports `sourceId/priority/leaseMs` and can include `driveAngle`.
+
+## Handshake Memory Model (avoid repeated probe loops)
+
+- Runtime keeps handshake/telemetry state in memory (small fixed-size fields in status).
+- Auto-probe uses backoff and pauses while external control lease is active.
+- Once telemetry is flowing, probe backoff resets and `serial_quickcheck` suppresses repeated probe bursts.
+- Memory impact is negligible (a few counters/timestamps/strings, no unbounded buffering beyond existing ring buffer).
 
 ## Development
 
