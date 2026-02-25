@@ -3,6 +3,21 @@ import { createInterface, Interface } from "node:readline";
 import type { TelemetryFrame } from "./types.js";
 
 const CONNECT_TIMEOUT_MS = 4000;
+const DEFAULT_CONTROL_ACK_TIMEOUT_MS = 1200;
+const CONTROL_ACK_HISTORY_MAX = 40;
+
+export type ControlAckPayload =
+  | Record<string, unknown>
+  | string
+  | number
+  | boolean
+  | null;
+
+interface PendingAck {
+  resolve: (payload: ControlAckPayload | null) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
 
 function formatConnectError(
   channel: "telemetry" | "control",
@@ -34,6 +49,14 @@ export class TelemetryClient {
   private rl: Interface | null = null;
   private frames: TelemetryFrame[] = [];
   private maxBuffered = 100;
+  private connected = false;
+
+  private onSocketClosed(): void {
+    this.connected = false;
+    this.rl?.close();
+    this.rl = null;
+    this.socket = null;
+  }
 
   async connect(host: string, port: number): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -41,6 +64,8 @@ export class TelemetryClient {
       const socket = createConnection({ host, port }, () => {
         if (settled) return;
         settled = true;
+        socket.setKeepAlive(true, 1000);
+        this.connected = true;
         this.rl = createInterface({ input: this.socket! });
         this.rl.on("line", (line) => {
           try {
@@ -68,6 +93,9 @@ export class TelemetryClient {
         socket.destroy();
         reject(new Error(formatConnectError("telemetry", host, port, error)));
       });
+      socket.on("close", () => {
+        this.onSocketClosed();
+      });
       this.socket = socket;
     });
   }
@@ -81,7 +109,25 @@ export class TelemetryClient {
     return result;
   }
 
+  snapshotFrames(count?: number): TelemetryFrame[] {
+    if (count === undefined) {
+      return this.frames.slice();
+    }
+    const safeCount = Math.max(0, Math.floor(count));
+    if (safeCount === 0) return [];
+    return this.frames.slice(-safeCount);
+  }
+
+  bufferedCount(): number {
+    return this.frames.length;
+  }
+
+  isConnected(): boolean {
+    return Boolean(this.connected && this.socket && !this.socket.destroyed);
+  }
+
   disconnect(): void {
+    this.connected = false;
     this.rl?.close();
     this.rl = null;
     this.socket?.destroy();
@@ -92,6 +138,69 @@ export class TelemetryClient {
 
 export class ControlClient {
   private socket: Socket | null = null;
+  private rl: Interface | null = null;
+  private pendingAcks: PendingAck[] = [];
+  private ackHistory: ControlAckPayload[] = [];
+  private connected = false;
+
+  private onSocketClosed(): void {
+    this.connected = false;
+    this.rejectAllPendingAcks("Control client disconnected");
+    this.rl?.close();
+    this.rl = null;
+    this.socket = null;
+  }
+
+  private parseAckLine(line: string): ControlAckPayload {
+    const trimmed = line.trim();
+    if (!trimmed) return null;
+    try {
+      return JSON.parse(trimmed) as ControlAckPayload;
+    } catch {
+      return trimmed;
+    }
+  }
+
+  private pushAckHistory(payload: ControlAckPayload): void {
+    this.ackHistory.push(payload);
+    if (this.ackHistory.length > CONTROL_ACK_HISTORY_MAX) {
+      this.ackHistory.shift();
+    }
+  }
+
+  private resolveNextPendingAck(payload: ControlAckPayload): void {
+    const next = this.pendingAcks.shift();
+    if (!next) return;
+    clearTimeout(next.timer);
+    next.resolve(payload);
+  }
+
+  private rejectAllPendingAcks(message: string): void {
+    const pending = this.pendingAcks.splice(0);
+    for (const entry of pending) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error(message));
+    }
+  }
+
+  private waitForAck(timeoutMs?: number): Promise<ControlAckPayload | null> {
+    const safeTimeout =
+      typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+        ? Math.max(100, Math.floor(timeoutMs))
+        : DEFAULT_CONTROL_ACK_TIMEOUT_MS;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const index = this.pendingAcks.findIndex((entry) => entry.timer === timer);
+        if (index >= 0) {
+          const [pending] = this.pendingAcks.splice(index, 1);
+          pending.reject(new Error(`Timed out waiting for control ACK after ${safeTimeout}ms`));
+          return;
+        }
+        reject(new Error(`Timed out waiting for control ACK after ${safeTimeout}ms`));
+      }, safeTimeout);
+      this.pendingAcks.push({ resolve, reject, timer });
+    });
+  }
 
   async connect(host: string, port: number): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -99,6 +208,14 @@ export class ControlClient {
       const socket = createConnection({ host, port }, () => {
         if (settled) return;
         settled = true;
+        socket.setKeepAlive(true, 1000);
+        this.connected = true;
+        this.rl = createInterface({ input: this.socket! });
+        this.rl.on("line", (line) => {
+          const payload = this.parseAckLine(line);
+          this.pushAckHistory(payload);
+          this.resolveNextPendingAck(payload);
+        });
         resolve();
       });
       socket.setTimeout(CONNECT_TIMEOUT_MS);
@@ -113,6 +230,9 @@ export class ControlClient {
         settled = true;
         socket.destroy();
         reject(new Error(formatConnectError("control", host, port, error)));
+      });
+      socket.on("close", () => {
+        this.onSocketClosed();
       });
       this.socket = socket;
     });
@@ -137,8 +257,61 @@ export class ControlClient {
     this.socket.write(normalized + "\n");
   }
 
+  async sendCommandWithAck(
+    command: Record<string, unknown>,
+    timeoutMs?: number
+  ): Promise<ControlAckPayload | null> {
+    if (!this.socket) {
+      throw new Error("Control client not connected");
+    }
+    const ackPromise = this.waitForAck(timeoutMs);
+    try {
+      this.sendCommand(command);
+    } catch (error) {
+      this.rejectAllPendingAcks(String(error));
+      throw error;
+    }
+    return ackPromise;
+  }
+
+  async sendRawLineWithAck(
+    line: string,
+    timeoutMs?: number
+  ): Promise<ControlAckPayload | null> {
+    if (!this.socket) {
+      throw new Error("Control client not connected");
+    }
+    const ackPromise = this.waitForAck(timeoutMs);
+    try {
+      this.sendRawLine(line);
+    } catch (error) {
+      this.rejectAllPendingAcks(String(error));
+      throw error;
+    }
+    return ackPromise;
+  }
+
+  getLatestAck(): ControlAckPayload | null {
+    if (this.ackHistory.length === 0) return null;
+    return this.ackHistory[this.ackHistory.length - 1] ?? null;
+  }
+
+  getAckHistory(limit = 10): ControlAckPayload[] {
+    const safeLimit = Math.max(1, Math.min(Math.floor(limit), CONTROL_ACK_HISTORY_MAX));
+    return this.ackHistory.slice(-safeLimit);
+  }
+
+  isConnected(): boolean {
+    return Boolean(this.connected && this.socket && !this.socket.destroyed);
+  }
+
   disconnect(): void {
+    this.connected = false;
+    this.rejectAllPendingAcks("Control client disconnected");
+    this.rl?.close();
+    this.rl = null;
     this.socket?.destroy();
     this.socket = null;
+    this.ackHistory = [];
   }
 }

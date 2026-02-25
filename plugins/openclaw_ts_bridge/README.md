@@ -66,6 +66,12 @@ node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
 node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
 ```
 
+3) Optional: flash UNO with auto COM yield (pause -> upload -> resume):
+
+```bash
+node plugins/openclaw_ts_bridge/upload_with_pause.js --com COM3 --fqbn arduino:avr:uno --sketch C:\\path\\to\\sketch
+```
+
 Notes:
 - `servo_pos` uses MVP plain line protocol: `"<angle>\n"` (for example `90\n`).
 - Bridge writes incoming TCP bytes to UNO serial as-is.
@@ -127,6 +133,10 @@ Examples:
 {"cmd":"set_keys","keys":["pos","velocity"]}
 {"cmd":"set_window","window":32}
 {"cmd":"set_param","block_name":"events","key":"spike_delta_threshold","value":1.5}
+{"cmd":"set_profile","profile":"imu_balance"}
+{"cmd":"set_autosave","enabled":true}
+{"cmd":"save_state"}
+{"cmd":"load_state"}
 ```
 
 ACK shape:
@@ -134,6 +144,17 @@ ACK shape:
 ```json
 {"type":"control_ack","ok":true,"cmd":"set_window","result":{"applied":true},"state":{...}}
 ```
+
+Available observer profiles:
+- `low_bandwidth`: lowest token pressure (`ax/ay/az`, slower interval)
+- `imu_balance`: IMU + servo posture summary for balancing tasks
+- `control_tuning`: servo/motor + IMU summary for control tuning
+
+State persistence:
+- Runtime state path default: `plugins/openclaw_ts_bridge/runtime_state.json`
+- `set_autosave=true`: each config change auto-persists
+- `save_state`: persist immediately
+- `load_state`: reload persisted runtime state without restarting bridge
 
 ## LLM Safe Control (low-rate)
 

@@ -191,6 +191,9 @@ _STATUS_REQUIRED_FIELDS = {
     "ring_buffer_usage_ratio",
     "control_commands_accepted",
     "control_commands_rejected",
+    "control_lease",
+    "auto_probe",
+    "telemetry_last_rx_s_ago",
 }
 
 
@@ -223,6 +226,21 @@ def test_get_status_fields(
     assert 0.0 <= ratio <= 1.0
     assert int(status["control_commands_accepted"]) >= 2
     assert int(status["control_commands_rejected"]) >= 1
+    auto_probe = status["auto_probe"]
+    assert isinstance(auto_probe, dict)
+    assert auto_probe["enabled"] is True
+    assert isinstance(auto_probe["sequence"], list)
+
+
+def test_auto_probe_sends_handshake_on_connect():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False, unsafe_passthrough=True)
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    adapter._reset_runtime_state()  # type: ignore[attr-defined]
+
+    sent = adapter._send_next_auto_probe(reason="test", force=True)  # type: ignore[attr-defined]
+    assert sent is True
+    assert any(item in fake.writes for item in [b"STATUS?\n", b"IMU_ON\n", b"TELEMETRY_ON\n", b"STREAM_ON\n", b"IMU?\n"])
 
 
 def test_invalid_json_frame(
@@ -335,6 +353,66 @@ def test_control_rate_limit_reset(rate_adapter):
     time.sleep(1.05)
     adapter._handle_control_command({"custom_control": 3})  # type: ignore[attr-defined]
     assert len(fake.writes) == 3
+
+
+# ---------------------------------------------------------------------------
+# Control queue during COM contention/pause
+# ---------------------------------------------------------------------------
+
+
+def test_control_is_queued_while_serial_paused_and_flushed_after_resume():
+    adapter = SerialAdapter(
+        "mock",
+        9600,
+        enable_tcp=False,
+        unsafe_passthrough=True,
+        max_control_rate=10,
+        max_queued_control=8,
+    )
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    adapter.pause_serial(hold_s=0)
+
+    ack = adapter._handle_control_command({"custom_control": 1})  # type: ignore[attr-defined]
+    assert isinstance(ack, dict)
+    assert ack["ok"] is True
+    assert ack["reason"] == "queued"
+
+    status_before = adapter.get_status()
+    assert status_before["serial_paused"] is True
+    assert status_before["queued_control_count"] == 1
+    assert status_before["control_commands_queued"] >= 1
+
+    adapter.resume_serial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    flushed = adapter._flush_queued_control(max_items=8)  # type: ignore[attr-defined]
+    assert flushed >= 1
+    assert any(b'"custom_control":1' in item for item in fake.writes)
+
+    status_after = adapter.get_status()
+    assert status_after["serial_paused"] is False
+    assert status_after["queued_control_count"] == 0
+
+
+def test_control_queue_full_is_rejected():
+    adapter = SerialAdapter(
+        "mock",
+        9600,
+        enable_tcp=False,
+        unsafe_passthrough=True,
+        max_control_rate=10,
+        max_queued_control=1,
+    )
+    adapter.pause_serial(hold_s=0)
+
+    ack1 = adapter._handle_control_command({"custom_control": 1})  # type: ignore[attr-defined]
+    ack2 = adapter._handle_control_command({"custom_control": 2})  # type: ignore[attr-defined]
+    assert isinstance(ack1, dict) and ack1["ok"] is True and ack1["reason"] == "queued"
+    assert isinstance(ack2, dict) and ack2["ok"] is False and ack2["reason"] == "queue_full"
+
+    status = adapter.get_status()
+    assert status["queued_control_count"] == 1
+    assert status["queued_control_dropped"] >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +609,83 @@ def test_unsafe_passthrough_allows_all():
     adapter._handle_control_command({"anything": 1})  # type: ignore[attr-defined]
     adapter._handle_control_command({"shutdown": 1})  # type: ignore[attr-defined]
     assert len(fake.writes) == 2
+
+
+# ---------------------------------------------------------------------------
+# Control source arbitration lease
+# ---------------------------------------------------------------------------
+
+
+def test_control_source_lease_blocks_anonymous_commands():
+    adapter = SerialAdapter(
+        "mock", 9600, enable_tcp=False, unsafe_passthrough=True, max_control_rate=20
+    )
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+
+    ack_owner = adapter._handle_control_command(  # type: ignore[attr-defined]
+        {"custom_control": 1, "source_id": "intent-a", "priority": 10, "lease_ms": 3000}
+    )
+    ack_anonymous = adapter._handle_control_command(  # type: ignore[attr-defined]
+        {"custom_control": 2}
+    )
+
+    assert isinstance(ack_owner, dict)
+    assert ack_owner["ok"] is True
+    assert isinstance(ack_anonymous, dict)
+    assert ack_anonymous["ok"] is False
+    assert ack_anonymous["reason"] == "lease_held_by_other"
+    assert len(fake.writes) == 1
+
+
+def test_control_source_lease_can_be_preempted_by_higher_priority():
+    adapter = SerialAdapter(
+        "mock", 9600, enable_tcp=False, unsafe_passthrough=True, max_control_rate=20
+    )
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+
+    ack_a = adapter._handle_control_command(  # type: ignore[attr-defined]
+        {"custom_control": 1, "source_id": "source-a", "priority": 0, "lease_ms": 3000}
+    )
+    ack_b = adapter._handle_control_command(  # type: ignore[attr-defined]
+        {"custom_control": 2, "source_id": "source-b", "priority": 5, "lease_ms": 3000}
+    )
+    ack_a_again = adapter._handle_control_command(  # type: ignore[attr-defined]
+        {"custom_control": 3, "source_id": "source-a", "priority": 0, "lease_ms": 3000}
+    )
+
+    assert isinstance(ack_a, dict) and ack_a["ok"] is True
+    assert isinstance(ack_b, dict) and ack_b["ok"] is True
+    assert isinstance(ack_a_again, dict)
+    assert ack_a_again["ok"] is False
+    assert ack_a_again["reason"] == "lease_held_by_other"
+    assert len(fake.writes) == 2
+
+
+def test_control_source_lease_expires_and_releases():
+    adapter = SerialAdapter(
+        "mock", 9600, enable_tcp=False, unsafe_passthrough=True, max_control_rate=20
+    )
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+
+    ack_owner = adapter._handle_control_command(  # type: ignore[attr-defined]
+        {"custom_control": 1, "source_id": "source-a", "priority": 1, "lease_ms": 3000}
+    )
+    assert isinstance(ack_owner, dict) and ack_owner["ok"] is True
+
+    with adapter._control_lock:  # type: ignore[attr-defined]
+        adapter._control_lease_expires_monotonic = time.monotonic() - 1.0  # type: ignore[attr-defined]
+
+    ack_anonymous = adapter._handle_control_command(  # type: ignore[attr-defined]
+        {"custom_control": 2}
+    )
+    assert isinstance(ack_anonymous, dict) and ack_anonymous["ok"] is True
+    assert len(fake.writes) == 2
+    status = adapter.get_status()
+    assert isinstance(status["control_lease"], dict)
+    assert status["control_lease"]["active"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,9 @@ export interface PluginConfig {
   maxControlRate?: number;
   autoDetectSerialPort?: boolean;
   portHints?: string[];
+  toolAutoConnect?: boolean;
+  autoResumeOnUse?: boolean;
+  bridgeAckTimeoutMs?: number;
 }
 
 export interface SerialPortInfo {

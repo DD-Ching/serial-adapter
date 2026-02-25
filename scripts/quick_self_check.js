@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { createConnection } from "node:net";
 import { resolve } from "node:path";
@@ -176,7 +176,25 @@ function computeNextSteps(result) {
   if (!result.serial_probe.ok) {
     steps.push("Install pyserial in your Python runtime: python -m pip install pyserial");
   }
+  if (
+    result.openclaw_extension?.exists === true &&
+    result.openclaw_extension?.up_to_date === false
+  ) {
+    steps.push(
+      "Installed OpenClaw extension is stale. Run: powershell -ExecutionPolicy Bypass -File scripts/deploy_local_extension.ps1 -RestartGateway",
+    );
+  }
   return steps;
+}
+
+function hasMarker(path, marker) {
+  if (!existsSync(path)) return false;
+  try {
+    const text = readFileSync(path, "utf8");
+    return text.includes(marker);
+  } catch {
+    return false;
+  }
 }
 
 async function main() {
@@ -190,6 +208,10 @@ async function main() {
   const llmScript = resolve(
     repoRoot,
     "plugins/openclaw_ts_bridge/send_llm_command.js",
+  );
+  const extensionDist = resolve(
+    process.env.USERPROFILE ?? process.env.HOME ?? "~",
+    ".openclaw/extensions/serial-adapter/dist/index.js",
   );
   const openclawCliPath =
     process.platform === "win32"
@@ -214,6 +236,13 @@ async function main() {
       path: openclawCliPath,
       exists: openclawCliPath ? existsSync(openclawCliPath) : null,
     },
+    openclaw_extension: {
+      path: extensionDist,
+      exists: existsSync(extensionDist),
+      has_serial_intent: hasMarker(extensionDist, "serial_intent"),
+      has_serial_bridge_sync: hasMarker(extensionDist, "serial_bridge_sync"),
+      up_to_date: false,
+    },
     artifacts: {
       algorithm_blocks_dist: existsSync(algorithmDist),
       bridge_script: existsSync(bridgeScript),
@@ -234,6 +263,10 @@ async function main() {
     serial_probe: serialProbe,
     next_steps: [],
   };
+  result.openclaw_extension.up_to_date =
+    result.openclaw_extension.exists &&
+    result.openclaw_extension.has_serial_intent &&
+    result.openclaw_extension.has_serial_bridge_sync;
 
   result.next_steps = computeNextSteps(result);
   result.ok =

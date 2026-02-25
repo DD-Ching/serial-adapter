@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
@@ -9,6 +9,7 @@ import { startControlPlane } from "./control_plane.js";
 
 const BRIDGE_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_PATH = resolve(BRIDGE_DIR, "config.json");
+const DEFAULT_STATE_PATH = resolve(BRIDGE_DIR, "runtime_state.json");
 const ALGO_BLOCKS_DIST_ENTRY = resolve(
   BRIDGE_DIR,
   "../algorithm_blocks_ts/dist/src/index.js",
@@ -56,6 +57,23 @@ const DEFAULT_CONFIG = {
 };
 
 const BLOCK_ORDER = ["pid", "summarizer"];
+const OBSERVER_PROFILES = {
+  low_bandwidth: {
+    keys: ["ax", "ay", "az"],
+    window: 24,
+    interval_ms: 1500,
+  },
+  imu_balance: {
+    keys: ["ax", "ay", "az", "gx", "gy", "gz", "servo"],
+    window: 48,
+    interval_ms: 1000,
+  },
+  control_tuning: {
+    keys: ["servo", "target_velocity", "motor_pwm", "ax", "ay", "az"],
+    window: 32,
+    interval_ms: 800,
+  },
+};
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
@@ -115,6 +133,27 @@ function normalizeEventConfig(events, fallback) {
     next.oscillating_flip_threshold = fallback.oscillating_flip_threshold;
   }
   return next;
+}
+
+function applyObserverProfile(runtimeConfig, eventDetector, profileName) {
+  const profile = OBSERVER_PROFILES[profileName];
+  if (!profile) {
+    throw new Error(`unknown profile: ${profileName}`);
+  }
+
+  runtimeConfig.summary.keys = normalizeKeys(
+    profile.keys,
+    runtimeConfig.summary.keys,
+  );
+  runtimeConfig.summary.window = Math.max(1, Math.floor(Number(profile.window)));
+  runtimeConfig.summary.interval_ms = Math.max(
+    100,
+    Math.floor(Number(profile.interval_ms)),
+  );
+
+  runtimeConfig.blocks.summarizer.config.keys = cloneJson(runtimeConfig.summary.keys);
+  runtimeConfig.blocks.summarizer.config.window = runtimeConfig.summary.window;
+  eventDetector.reset(runtimeConfig.summary.events);
 }
 
 function loadConfigFile(configPath) {
@@ -188,6 +227,7 @@ function mergeConfig(base, loaded) {
 function parseArgs(argv) {
   const out = {
     configPath: DEFAULT_CONFIG_PATH,
+    statePath: DEFAULT_STATE_PATH,
     host: null,
     port: null,
     intervalMs: null,
@@ -201,6 +241,11 @@ function parseArgs(argv) {
     const next = argv[i + 1];
     if (arg === "--config" && next) {
       out.configPath = resolve(process.cwd(), next);
+      i += 1;
+      continue;
+    }
+    if (arg === "--state-path" && next) {
+      out.statePath = resolve(process.cwd(), next);
       i += 1;
       continue;
     }
@@ -379,6 +424,33 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const loadedConfig = loadConfigFile(args.configPath);
   let runtimeConfig = mergeConfig(DEFAULT_CONFIG, loadedConfig);
+  const statePath = args.statePath;
+  let activeProfile = "custom";
+  let autoSave = true;
+
+  if (existsSync(statePath)) {
+    try {
+      const loadedState = loadConfigFile(statePath);
+      runtimeConfig = mergeConfig(runtimeConfig, loadedState);
+      const runtimeMeta = isObject(loadedState.runtime) ? loadedState.runtime : null;
+      if (runtimeMeta && typeof runtimeMeta.active_profile === "string") {
+        const nextProfile = runtimeMeta.active_profile.trim();
+        if (nextProfile) activeProfile = nextProfile;
+      }
+      if (runtimeMeta && typeof runtimeMeta.auto_save === "boolean") {
+        autoSave = runtimeMeta.auto_save;
+      }
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: "bridge_state_load_warning",
+          state_path: statePath,
+          message: String(error),
+        }),
+      );
+    }
+  }
+
   const { AlgorithmPipeline, PidBlock, SummarizerBlock } =
     await loadAlgorithmBlocks();
   const blockFactories = {
@@ -394,14 +466,17 @@ async function main() {
   }
   if (Number.isFinite(args.intervalMs) && args.intervalMs >= 100) {
     runtimeConfig.summary.interval_ms = Math.floor(args.intervalMs);
+    activeProfile = "custom";
   }
   if (Number.isFinite(args.window) && args.window > 0) {
     runtimeConfig.summary.window = Math.floor(args.window);
     runtimeConfig.blocks.summarizer.config.window = runtimeConfig.summary.window;
+    activeProfile = "custom";
   }
   if (Array.isArray(args.keys) && args.keys.length > 0) {
     runtimeConfig.summary.keys = normalizeKeys(args.keys, runtimeConfig.summary.keys);
     runtimeConfig.blocks.summarizer.config.keys = cloneJson(runtimeConfig.summary.keys);
+    activeProfile = "custom";
   }
 
   let pipeline = null;
@@ -414,6 +489,13 @@ async function main() {
   let logTimer = null;
 
   const eventDetector = createEventDetector(runtimeConfig.summary.events);
+  if (activeProfile !== "custom") {
+    if (OBSERVER_PROFILES[activeProfile]) {
+      applyObserverProfile(runtimeConfig, eventDetector, activeProfile);
+    } else {
+      activeProfile = "custom";
+    }
+  }
   const socket = createConnection({
     host: runtimeConfig.telemetry.host,
     port: runtimeConfig.telemetry.port,
@@ -448,7 +530,62 @@ async function main() {
       },
       blocks: cloneJson(runtimeConfig.blocks),
       active_blocks: activeBlocks,
+      active_profile: activeProfile,
+      available_profiles: Object.keys(OBSERVER_PROFILES),
+      state_path: statePath,
+      autosave: autoSave,
     };
+  };
+
+  const snapshotPersistedState = () => ({
+    telemetry: cloneJson(runtimeConfig.telemetry),
+    summary: cloneJson(runtimeConfig.summary),
+    blocks: cloneJson(runtimeConfig.blocks),
+    runtime: {
+      active_profile: activeProfile,
+      auto_save: autoSave,
+    },
+  });
+
+  const resolveRequestedStatePath = (requestedPath) => {
+    if (typeof requestedPath !== "string" || !requestedPath.trim()) {
+      return statePath;
+    }
+    return resolve(process.cwd(), requestedPath);
+  };
+
+  const saveStateToDisk = (requestedPath) => {
+    const targetPath = resolveRequestedStatePath(requestedPath);
+    const payload = JSON.stringify(snapshotPersistedState(), null, 2) + "\n";
+    writeFileSync(targetPath, payload, "utf8");
+    return targetPath;
+  };
+
+  const loadStateFromDisk = (requestedPath) => {
+    const targetPath = resolveRequestedStatePath(requestedPath);
+    if (!existsSync(targetPath)) {
+      throw new Error(`state file not found: ${targetPath}`);
+    }
+    const loadedState = loadConfigFile(targetPath);
+    runtimeConfig = mergeConfig(runtimeConfig, loadedState);
+    const runtimeMeta = isObject(loadedState.runtime) ? loadedState.runtime : null;
+    if (runtimeMeta && typeof runtimeMeta.auto_save === "boolean") {
+      autoSave = runtimeMeta.auto_save;
+    }
+    if (runtimeMeta && typeof runtimeMeta.active_profile === "string") {
+      const nextProfile = runtimeMeta.active_profile.trim();
+      if (nextProfile === "custom") {
+        activeProfile = "custom";
+      } else if (OBSERVER_PROFILES[nextProfile]) {
+        applyObserverProfile(runtimeConfig, eventDetector, nextProfile);
+        activeProfile = nextProfile;
+      } else {
+        activeProfile = "custom";
+      }
+    }
+    buildPipeline();
+    restartLogTimer();
+    return targetPath;
   };
 
   const restartLogTimer = () => {
@@ -473,6 +610,24 @@ async function main() {
     }, runtimeConfig.summary.interval_ms);
   };
 
+  const maybeAutosaveResult = (result) => {
+    if (!autoSave) return result;
+    try {
+      const savedPath = saveStateToDisk();
+      return {
+        ...result,
+        autosaved: true,
+        state_path: savedPath,
+      };
+    } catch (error) {
+      return {
+        ...result,
+        autosaved: false,
+        autosave_error: String(error),
+      };
+    }
+  };
+
   const applyCommand = (command) => {
     const blockName = command.block_name;
     switch (command.cmd) {
@@ -482,7 +637,7 @@ async function main() {
         }
         runtimeConfig.blocks[blockName].enabled = true;
         buildPipeline();
-        return { applied: true };
+        return maybeAutosaveResult({ applied: true });
       }
       case "disable_block": {
         if (!runtimeConfig.blocks[blockName]) {
@@ -490,9 +645,10 @@ async function main() {
         }
         runtimeConfig.blocks[blockName].enabled = false;
         buildPipeline();
-        return { applied: true };
+        return maybeAutosaveResult({ applied: true });
       }
       case "set_param": {
+        activeProfile = "custom";
         if (blockName === "events") {
           runtimeConfig.summary.events[command.key] = command.value;
           runtimeConfig.summary.events = normalizeEventConfig(
@@ -500,7 +656,7 @@ async function main() {
             DEFAULT_CONFIG.summary.events,
           );
           eventDetector.reset(runtimeConfig.summary.events);
-          return { applied: true };
+          return maybeAutosaveResult({ applied: true });
         }
         if (!runtimeConfig.blocks[blockName]) {
           throw new Error(`unknown block_name: ${blockName}`);
@@ -522,9 +678,10 @@ async function main() {
           eventDetector.reset(runtimeConfig.summary.events);
         }
         buildPipeline();
-        return { applied: true };
+        return maybeAutosaveResult({ applied: true });
       }
       case "set_keys": {
+        activeProfile = "custom";
         runtimeConfig.summary.keys = normalizeKeys(
           command.keys,
           runtimeConfig.summary.keys,
@@ -533,22 +690,51 @@ async function main() {
           runtimeConfig.summary.keys,
         );
         buildPipeline();
-        return { applied: true };
+        return maybeAutosaveResult({ applied: true });
       }
       case "set_window": {
+        activeProfile = "custom";
         runtimeConfig.summary.window = Math.max(1, Math.floor(command.window));
         runtimeConfig.blocks.summarizer.config.window = runtimeConfig.summary.window;
         buildPipeline();
         eventDetector.reset(runtimeConfig.summary.events);
-        return { applied: true };
+        return maybeAutosaveResult({ applied: true });
       }
       case "set_interval_ms": {
+        activeProfile = "custom";
         runtimeConfig.summary.interval_ms = Math.max(
           100,
           Math.floor(command.interval_ms),
         );
         restartLogTimer();
-        return { applied: true };
+        return maybeAutosaveResult({ applied: true });
+      }
+      case "set_profile": {
+        applyObserverProfile(
+          runtimeConfig,
+          eventDetector,
+          command.profile,
+        );
+        activeProfile = command.profile;
+        buildPipeline();
+        restartLogTimer();
+        return maybeAutosaveResult({ applied: true, profile: command.profile });
+      }
+      case "save_state": {
+        const savedPath = saveStateToDisk(command.path);
+        return { applied: true, state_path: savedPath };
+      }
+      case "load_state": {
+        const loadedPath = loadStateFromDisk(command.path);
+        return { applied: true, state_path: loadedPath };
+      }
+      case "set_autosave": {
+        autoSave = command.enabled;
+        if (autoSave) {
+          const savedPath = saveStateToDisk();
+          return { applied: true, autosave: autoSave, state_path: savedPath };
+        }
+        return { applied: true, autosave: autoSave };
       }
       default:
         throw new Error(`unsupported cmd: ${command.cmd}`);
@@ -593,6 +779,10 @@ async function main() {
         interval_ms: runtimeConfig.summary.interval_ms,
         window: runtimeConfig.summary.window,
         keys: runtimeConfig.summary.keys,
+        active_profile: activeProfile,
+        available_profiles: Object.keys(OBSERVER_PROFILES),
+        state_path: statePath,
+        autosave: autoSave,
       }),
     );
   });

@@ -62,6 +62,42 @@
       },
       "required": ["cmd", "interval_ms"],
       "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "set_profile" },
+        "profile": { "type": "string", "minLength": 1 }
+      },
+      "required": ["cmd", "profile"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "save_state" },
+        "path": { "type": "string", "minLength": 1 }
+      },
+      "required": ["cmd"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "load_state" },
+        "path": { "type": "string", "minLength": 1 }
+      },
+      "required": ["cmd"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "set_autosave" },
+        "enabled": { "type": "boolean" }
+      },
+      "required": ["cmd", "enabled"],
+      "additionalProperties": false
     }
   ]
 }

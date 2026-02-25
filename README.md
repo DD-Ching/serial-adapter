@@ -14,6 +14,11 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 - TCP telemetry stream (read-only broadcast, default `9000`)
 - TCP control channel (command ingress, default `9001`, with optional ACK response)
 - Auto serial-port probing with best-effort UNO/USB-serial matching
+- Self-healing bridge sync (`serial_bridge_sync`) for auto-connect + auto-resume flows
+- Sticky bridge session semantics: tools reuse the same live bridge session instead of restarting on every command
+- Multi-source control arbitration lease (`source_id` + `priority` + `lease_ms`) to avoid command collisions
+- Runtime auto-probe handshake (`STATUS?`, `IMU_ON`, `TELEMETRY_ON`, `STREAM_ON`, `IMU?`) to reduce “connected but no telemetry” loops
+- Smart probe suppression: when telemetry is already flowing, `serial_quickcheck` skips redundant handshake bursts
 - Observer API (`poll`, `poll_all`, `register_callback`, `get_latest_frame`, `get_last_n_frames`)
 - Control safety enforcement (`unsafe_passthrough`, allowlist, rate limiting)
 - Built-in motion templates (`slow_sway`, `fast_jitter`, `sweep`, `center_stop`)
@@ -38,6 +43,10 @@ Legacy or optional (kept, not removed):
 
 Goal: read telemetry (`9000`), print low-rate summary, send low-rate control (`9001`) with clear ACK.
 
+Windows note:
+- Use `docs/windows-runtime-playbook.md` to avoid repeated PATH/quoting/COM pitfalls.
+- Prefer absolute tool paths on Windows shells.
+
 1. Quick self-check (node path, dist artifact, port status, serial probe):
 
 Windows:
@@ -52,6 +61,12 @@ macOS/Linux:
 node scripts/quick_self_check.js --json
 ```
 
+If `openclaw_extension.up_to_date=false`, refresh your installed extension:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/deploy_local_extension.ps1 -RestartGateway
+```
+
 2. Start OpenClaw gateway:
 
 ```bash
@@ -64,13 +79,24 @@ openclaw gateway start
 node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/config.json
 ```
 
-4. Send low-rate control command and read machine-readable ACK:
+4. Strict hardware E2E gate (handshake -> observe -> drive):
+
+```bash
+python scripts/hardware_e2e_check.py --host 127.0.0.1 --control-port 9001 --telemetry-port 9000 --observe-s 2.5 --drive-angle 90
+```
+
+5. Send low-rate control command and read machine-readable ACK:
 
 ```bash
 node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
 ```
 
-5. Optional UNO MVP control channel (if you use plain servo angle line protocol):
+Bridge stability rule (important):
+- Once connected, tools keep using the same bridge session.
+- If a TCP channel drops, plugin re-attaches channel first (without restarting subprocess/COM) and only restarts as last resort.
+- Check session continuity from tool responses: `bridge.session.session_id`.
+
+6. Optional UNO MVP control channel (if you use plain servo angle line protocol):
 
 ```bash
 node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
@@ -83,6 +109,9 @@ Before opening any PR, run and review:
 - `docs/release/PRE_PR_CHECKLIST.md`
 
 Rule: if checklist is not fully green, stop and fix first.
+
+Baseline marker for this development cycle:
+- `docs/release/BASELINE_2026-02-24.md`
 
 ## COM Port Guardrail (Upload vs Runtime)
 
@@ -98,25 +127,33 @@ You can now ask runtime to temporarily release COM for upload, then auto/manual 
 Pause and release COM immediately (hold for 30s):
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"pause\",\"hold_s\":30}"
+python examples/runtime_ops.py pause --hold-s 30
 ```
 
 Resume COM right after upload:
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"resume\"}"
+python examples/runtime_ops.py resume
+```
+
+One-shot upload flow (auto pause/resume around `arduino-cli upload`):
+
+```bash
+node plugins/openclaw_ts_bridge/upload_with_pause.js --com COM3 --fqbn arduino:avr:uno --sketch C:\\path\\to\\sketch
 ```
 
 Check runtime serial status:
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"status\"}"
+python examples/runtime_ops.py status
+python examples/runtime_ops.py capabilities
 ```
 
 Behavior:
 - `pause` closes serial handle but keeps plugin process/TCP ports alive.
 - During pause, adapter does not occupy COM.
 - After `resume` (or `hold_s` timeout), adapter retries reopening COM every ~2s.
+- Control commands received during COM pause/conflict are queued (bounded queue) and flushed automatically after reconnect.
 - If there is no COM conflict, keep runtime normal (no pause/resume needed).
 
 ## Installation
@@ -197,7 +234,10 @@ Add to your OpenClaw config (`openclaw.json`):
           "baudrate": 115200,
           "telemetryPort": 9000,
           "controlPort": 9001,
-          "host": "127.0.0.1"
+          "host": "127.0.0.1",
+          "toolAutoConnect": true,
+          "autoResumeOnUse": true,
+          "bridgeAckTimeoutMs": 1200
         }
       }
     }
@@ -220,6 +260,9 @@ Add to your OpenClaw config (`openclaw.json`):
 | `unsafePassthrough` | boolean | `false` | Allow all control keys |
 | `allowedCommands` | string[] | `["motor_pwm", "target_velocity"]` | Command allowlist |
 | `maxControlRate` | number | `50` | Max control commands per second |
+| `toolAutoConnect` | boolean | `true` | Let tools auto-connect when disconnected |
+| `autoResumeOnUse` | boolean | `true` | Let tools auto-resume runtime when serial is paused |
+| `bridgeAckTimeoutMs` | number | `1200` | ACK timeout for runtime control/status commands |
 
 ## Registered Tools
 
@@ -227,10 +270,14 @@ Add to your OpenClaw config (`openclaw.json`):
 |---|---|
 | `serial_probe` | List detected serial ports and suggest the best candidate |
 | `serial_connect` | Connect to serial device and start adapter |
-| `serial_poll` | Read available telemetry frames |
+| `serial_intent` | Natural-language intent control (left/right/stop/nod/status) |
+| `serial_bridge_sync` | Ensure bridge is connected/resumed and return runtime status |
+| `serial_quickcheck` | One-shot check: auto-connect (optional) + sample telemetry + IMU detection |
+| `serial_poll` | Read telemetry with compact summary (`includeFrames=true` for raw debug) |
 | `serial_send` | Send a control command to serial device |
+| `serial_stop` | Best-effort stop sequence with telemetry verification |
 | `serial_motion_template` | Run built-in servo motion templates |
-| `serial_status` | Get adapter runtime status |
+| `serial_status` | Get runtime status + recent telemetry snapshot summary |
 | `serial_pause` | Temporarily release COM for upload |
 | `serial_resume` | Re-open COM after upload |
 
@@ -238,31 +285,83 @@ Add to your OpenClaw config (`openclaw.json`):
 
 Use prompts like these with your OpenClaw agent:
 
-1. Connect and check status:
+1. Stable bridge handshake (recommended first step):
 ```text
-Call serial_probe first and pick the suggested port, then run serial_connect with baudrate 115200, then call serial_status.
+Run serial_bridge_sync with autoConnect true, autoResume true.
+Return bridge status, runtime_status.degraded, and telemetry_summary only.
 ```
 
-2. Servo sweep test (visible frequency / PWM change):
+2. Conversation-native intent control (Telegram style):
+```text
+When user says things like "往左一點", "往右一點", "停下來", "點點頭", "看一下狀態",
+call serial_intent with instruction set to the original sentence.
+Do not ask for Arduino syntax unless serial_intent returns intent_unrecognized.
+Return brief action + verification summary.
+```
+
+3. Connect and detect IMU in one shot:
+```text
+Run serial_quickcheck with observeMs 1500.
+If disconnected, autoConnect should be true.
+Return only summary and whether IMU (ax/ay/az or gx/gy/gz) is detected.
+```
+
+3b. Connect + probe + drive test in one shot:
+```text
+Run serial_quickcheck with observeMs 1500, driveAngle 90, triggerProbe true.
+Return summary, drive_action, and diagnosis.
+```
+
+4. Servo sweep test (visible frequency / PWM change):
 ```text
 Send motor_pwm commands in steps: 1200, 1400, 1600, 1700.
 Wait 2 seconds between each step.
 After each step, call serial_poll and summarize latest telemetry.
 ```
 
-2b. Raw servo shorthand (MVP):
+5. Raw servo shorthand (MVP):
 ```text
 Use serial_send with command "90" (or "A90"), then call serial_status.
 ```
 
-3. Safe stop:
+6. Safe stop (verified):
 ```text
-Send a final command {"motor_pwm": 0}, then call serial_status.
+Call serial_stop with targetAngle 90 and verifyMs 1200.
+If verification.verified is false/null, report "command sent but not verified" (do not claim stopped).
 ```
 
-4. Run template motion directly:
+7. Run template motion directly:
 ```text
 Run serial_motion_template with template "slow_sway", repeats 2, intervalMs 400.
+```
+
+8. LLM behavior guard (avoid "ask-back loop"):
+```text
+When user asks "can you detect IMU now?", do not ask back.
+Call serial_quickcheck immediately and return diagnosis/next_step.
+```
+
+## If `serial_stop` Is Not Verified
+
+If `serial_stop` returns `verification.verified=false` and the motor keeps moving, your board firmware is likely running an autonomous loop and ignoring runtime serial commands.
+
+Use the provided reference firmware:
+
+- `firmware/uno_mpu6050_servo_runtime/uno_mpu6050_servo_runtime.ino`
+- Board: `Arduino Uno`
+- Baud: `115200`
+
+Behavior of this firmware:
+
+- Power-up default is `hold` (no automatic sweep).
+- Supports `STOP`, `SWEEP_OFF`, `A90`, `90`, `P1500`.
+- Emits JSON telemetry with `ax/ay/az/gx/gy/gz/servo`.
+
+After flashing, run:
+
+```text
+serial_quickcheck(observeMs=1200)
+serial_stop(targetAngle=90, verifyMs=1200)
 ```
 
 ## Prototype Status
@@ -280,12 +379,46 @@ Run serial_motion_template with template "slow_sway", repeats 2, intervalMs 400.
 - Use `allowedCommands` to limit accepted control keys.
 - Keep a conservative `maxControlRate` for initial hardware tests.
 
+## Multi-Source Control Arbitration
+
+Control commands may include optional metadata:
+
+- `source_id`: logical command source (for example `serial_intent`, `telegram_agent`, `manual_debug`)
+- `priority`: `-100..100` (higher source can preempt lower source lease)
+- `lease_ms`: lease duration (`200..120000`)
+
+Behavior:
+
+- Commands with `source_id` acquire/refresh a control lease.
+- Anonymous commands (without `source_id`) are blocked while another lease is active.
+- Higher-priority sources can preempt lower-priority sources.
+
+Current tool defaults:
+
+- `serial_intent` uses `source_id=serial_intent` by default.
+- `serial_stop` and `serial_motion_template` also attach a default source lease.
+- `serial_send` supports optional `sourceId/priority/leaseMs` when you need explicit ownership.
+- `serial_quickcheck` also supports `sourceId/priority/leaseMs` and can include `driveAngle`.
+
+## Handshake Memory Model (avoid repeated probe loops)
+
+- Runtime keeps handshake/telemetry state in memory (small fixed-size fields in status).
+- Auto-probe uses backoff and pauses while external control lease is active.
+- Once telemetry is flowing, probe backoff resets and `serial_quickcheck` suppresses repeated probe bursts.
+- Memory impact is negligible (a few counters/timestamps/strings, no unbounded buffering beyond existing ring buffer).
+
 ## Development
 
 ### Run core tests
 
 ```bash
 python -m pytest tests/test_tcp_server.py tests/test_adapter.py
+```
+
+### Run hardware regression guard (observer + control + IMU fields)
+
+```bash
+python scripts/regression_guard.py --host 127.0.0.1 --control-port 9001 --telemetry-port 9000 --timeout-s 3 --angle 90
 ```
 
 ### Monitor telemetry (standalone)
@@ -297,7 +430,8 @@ python examples/tcp_monitor.py --host 127.0.0.1 --port 9000
 ### Send control command (standalone)
 
 ```bash
-python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"target_velocity\":1.5}"
+python examples/runtime_ops.py set --target target_velocity --value 1.5
+python examples/runtime_ops.py servo --angle 90
 ```
 
 ### Build TypeScript
@@ -327,3 +461,4 @@ OpenClaw Gateway
 
 - Protocol: `docs/protocol.md`
 - Architecture: `docs/architecture.md`
+- Windows runtime playbook: `docs/windows-runtime-playbook.md`
