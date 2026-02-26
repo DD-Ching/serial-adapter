@@ -12,19 +12,55 @@ $ErrorActionPreference = "Stop"
 
 function Get-FirstJsonText {
   param([string]$Text)
-  $start = $Text.IndexOf("{")
-  $end = $Text.LastIndexOf("}")
-  if ($start -lt 0 -or $end -le $start) {
+  if ([string]::IsNullOrWhiteSpace($Text)) {
     throw "No JSON payload found in text output."
   }
-  return $Text.Substring($start, $end - $start + 1)
+  $start = $Text.IndexOf("{")
+  if ($start -lt 0) {
+    throw "No JSON payload found in text output."
+  }
+  $depth = 0
+  $inString = $false
+  $escape = $false
+  for ($i = $start; $i -lt $Text.Length; $i++) {
+    $ch = $Text[$i]
+    if ($inString) {
+      if ($escape) {
+        $escape = $false
+        continue
+      }
+      if ($ch -eq '\') {
+        $escape = $true
+        continue
+      }
+      if ($ch -eq '"') {
+        $inString = $false
+      }
+      continue
+    }
+    if ($ch -eq '"') {
+      $inString = $true
+      continue
+    }
+    if ($ch -eq '{') {
+      $depth += 1
+      continue
+    }
+    if ($ch -eq '}') {
+      $depth -= 1
+      if ($depth -eq 0) {
+        return $Text.Substring($start, $i - $start + 1)
+      }
+    }
+  }
+  throw "No complete JSON object found in text output."
 }
 
 function Invoke-JsonCommand {
   param(
     [scriptblock]$Command
   )
-  $raw = (& $Command | Out-String)
+  $raw = (& $Command | Out-String -Width 100000)
   $jsonText = Get-FirstJsonText -Text $raw
   return ($jsonText | ConvertFrom-Json)
 }
@@ -34,12 +70,24 @@ function Invoke-AgentPayloadJson {
   if (-not (Test-Path $OpenClaw)) {
     throw "openclaw executable not found: $OpenClaw"
   }
-  $outer = Invoke-JsonCommand -Command {
-    & $OpenClaw agent --agent $Agent --message $Message --json --timeout $AgentTimeoutSeconds
+  $lastError = $null
+  for ($attempt = 1; $attempt -le 5; $attempt++) {
+    try {
+      $outer = Invoke-JsonCommand -Command {
+        & $OpenClaw agent --agent $Agent --message $Message --json --timeout $AgentTimeoutSeconds
+      }
+      if ($null -ne $outer.result -and $null -ne $outer.result.payloads -and $outer.result.payloads.Count -ge 1) {
+        $payloadText = [string]$outer.result.payloads[0].text
+        $innerText = Get-FirstJsonText -Text $payloadText
+        return ($innerText | ConvertFrom-Json -ErrorAction Stop)
+      }
+      return $outer
+    } catch {
+      $lastError = $_
+      Start-Sleep -Milliseconds 450
+    }
   }
-  $payloadText = [string]$outer.result.payloads[0].text
-  $innerText = Get-FirstJsonText -Text $payloadText
-  return ($innerText | ConvertFrom-Json)
+  throw "Invoke-AgentPayloadJson failed after retries: $lastError"
 }
 
 function Normalize-RepoUrl {
@@ -80,14 +128,24 @@ $hardware = Invoke-JsonCommand -Command {
     --drive-angle 90
 }
 
-$sessionA = Invoke-AgentPayloadJson -Message "Run serial_quickcheck with observeMs=1200, triggerProbe=false. Return JSON only."
+$sessionA = Invoke-AgentPayloadJson -Message @"
+Run serial_bridge_sync with includeCapabilities=false.
+Return ONLY minified JSON:
+{"status":"connected|disconnected","session_id":number|null,"reconnect_count":number|null}
+Do not include extra text.
+"@
 Start-Sleep -Milliseconds 300
-$sessionB = Invoke-AgentPayloadJson -Message "Run serial_quickcheck with observeMs=1200, triggerProbe=false. Return JSON only."
+$sessionB = Invoke-AgentPayloadJson -Message @"
+Run serial_bridge_sync with includeCapabilities=false.
+Return ONLY minified JSON:
+{"status":"connected|disconnected","session_id":number|null,"reconnect_count":number|null}
+Do not include extra text.
+"@
 
-$sidA = $sessionA.bridge.session.session_id
-$sidB = $sessionB.bridge.session.session_id
-$rcA = $sessionA.bridge.session.reconnect_count
-$rcB = $sessionB.bridge.session.reconnect_count
+$sidA = if ($null -ne $sessionA.session_id) { $sessionA.session_id } else { $sessionA.bridge.session.session_id }
+$sidB = if ($null -ne $sessionB.session_id) { $sessionB.session_id } else { $sessionB.bridge.session.session_id }
+$rcA = if ($null -ne $sessionA.reconnect_count) { $sessionA.reconnect_count } else { $sessionA.bridge.session.reconnect_count }
+$rcB = if ($null -ne $sessionB.reconnect_count) { $sessionB.reconnect_count } else { $sessionB.bridge.session.reconnect_count }
 $sessionSticky = ($null -ne $sidA -and $null -ne $sidB -and [string]$sidA -eq [string]$sidB)
 $reconnectStable = ($null -ne $rcA -and $null -ne $rcB -and ([int]$rcB - [int]$rcA) -le 1)
 

@@ -1762,6 +1762,12 @@ const plugin = {
         includeFrames: Type.Optional(
           Type.Boolean({ description: "Include sampled frames for debug." })
         ),
+        includeRuntimeStatus: Type.Optional(
+          Type.Boolean({
+            description:
+              "Include full bridge.runtime_status in response (default false for compact output).",
+          })
+        ),
         driveAngle: Type.Optional(
           Type.Number({
             description:
@@ -1942,6 +1948,7 @@ const plugin = {
           };
         }
         const includeFrames = params.includeFrames === true;
+        const includeRuntimeStatus = params.includeRuntimeStatus === true;
 
         return jsonResult({
           status: "connected",
@@ -1962,7 +1969,7 @@ const plugin = {
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,
-            runtime_status: bridge.runtime_status,
+            runtime_status: includeRuntimeStatus ? bridge.runtime_status : undefined,
             session: bridge.bridge_session,
           },
           frames: optionalFrames(observed.frames, includeFrames),

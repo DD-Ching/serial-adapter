@@ -103,6 +103,12 @@ Runtime-only preflight (faster, before semantic/hardware checks):
 npm run preflight-runtime
 ```
 
+Repeatable full validation (single command for recurring checks):
+
+```powershell
+npm run validate:repeatable
+```
+
 The command prints one JSON report with:
 - `publish_ready`: true means packaging/install/compliance gates are green.
 - `merge_main_ready`: true means publish gate + semantic gate + hardware gate are all green.
