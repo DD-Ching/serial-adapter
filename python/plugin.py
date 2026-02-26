@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 try:
@@ -95,6 +97,75 @@ AUTO_PROBE_SEQUENCE: tuple[str, ...] = (
 AUTO_PROBE_IDLE_INTERVAL_S = 1.5
 AUTO_PROBE_MIN_GAP_S = 0.35
 AUTO_PROBE_MAX_BACKOFF_S = 30.0
+SILENT_TELEMETRY_THRESHOLD_S = 4.0
+IMU_MISSING_DIAG_MIN_FRAMES = 12
+
+RECOVERY_ACTION_SILENT = "silent_probe_burst"
+RECOVERY_ACTION_REOPEN = "serial_reopen"
+RECOVERY_ACTION_MAX_ATTEMPTS: Dict[str, int] = {
+    RECOVERY_ACTION_SILENT: 8,
+    RECOVERY_ACTION_REOPEN: 12,
+}
+RECOVERY_ACTION_COOLDOWN_S: Dict[str, float] = {
+    RECOVERY_ACTION_SILENT: 6.0,
+    RECOVERY_ACTION_REOPEN: 2.0,
+}
+SILENT_HARDWARE_ESCALATION_ATTEMPTS = 8
+SILENT_PROBE_SUPPRESS_SECONDS = 90.0
+
+DIAG_CODE_OK = "ok"
+DIAG_CODE_SERIAL_PAUSED = "serial_paused"
+DIAG_CODE_SERIAL_DISCONNECTED = "serial_disconnected"
+DIAG_CODE_SERIAL_PORT_BUSY = "serial_port_busy"
+DIAG_CODE_SERIAL_READ_ERROR = "serial_read_error"
+DIAG_CODE_SERIAL_SILENT = "serial_silent_no_telemetry_bytes"
+DIAG_CODE_TELEMETRY_NO_IMU = "telemetry_without_imu_fields"
+
+PORT_BUSY_ERROR_HINTS: tuple[str, ...] = (
+    "access is denied",
+    "permissionerror",
+    "resource busy",
+    "in use",
+    "busy",
+    "device or resource busy",
+    "cannot open",
+    "could not open port",
+)
+DIAG_PERSIST_VERSION = 1
+
+
+def _is_busy_error_text(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    normalized = str(text).strip().lower()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in PORT_BUSY_ERROR_HINTS)
+
+
+def _diagnosis_default_next_step(code: str) -> str:
+    normalized = str(code).strip().lower()
+    if normalized == DIAG_CODE_OK:
+        return "Telemetry is flowing."
+    if normalized == DIAG_CODE_SERIAL_PAUSED:
+        return "Call serial_resume before telemetry/control operations."
+    if normalized == DIAG_CODE_SERIAL_PORT_BUSY:
+        return "Close Arduino Serial Monitor/uploader or other COM owner, then retry."
+    if normalized == DIAG_CODE_SERIAL_DISCONNECTED:
+        return "Check cable/power; runtime will retry COM reopen automatically."
+    if normalized == DIAG_CODE_SERIAL_READ_ERROR:
+        return "Check COM stability/cable quality; runtime will retry reconnect."
+    if normalized == DIAG_CODE_SERIAL_SILENT:
+        return (
+            "Firmware is not emitting telemetry bytes. Enable telemetry output "
+            "(IMU_ON/TELEMETRY_ON/STREAM_ON) or reflash firmware."
+        )
+    if normalized == DIAG_CODE_TELEMETRY_NO_IMU:
+        return (
+            "Telemetry exists but IMU fields missing. Ensure firmware outputs "
+            "ax/ay/az (and optional gx/gy/gz)."
+        )
+    return "Inspect runtime diagnosis and serial logs."
 
 
 class SerialAdapter:
@@ -146,6 +217,19 @@ class SerialAdapter:
         self._next_probe_index = 0
         self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
         self._auto_probe_fail_streak = 0
+        self._telemetry_frame_count = 0
+        self._imu_frame_count = 0
+
+        now_wall = time.time()
+        self._diagnosis_code = DIAG_CODE_SERIAL_DISCONNECTED
+        self._diagnosis_severity = "warning"
+        self._diagnosis_detail = "Serial adapter initialized, waiting for connection."
+        self._diagnosis_since_wall = now_wall
+        self._diagnosis_updated_wall = now_wall
+        self._recovery_attempts: Dict[str, int] = {}
+        self._recovery_cooldown_until_wall: Dict[str, float] = {}
+        self._idle_probe_suppressed_until_wall = 0.0
+        self._diag_persist_path = self._resolve_diag_persist_path()
 
         self._serial: Optional[Any] = None
         self._serial_reopen_interval_s = float(DEFAULT_REOPEN_INTERVAL_S)
@@ -154,6 +238,7 @@ class SerialAdapter:
         self._pause_until_monotonic: Optional[float] = None
         self._serial_reconnect_attempts = 0
         self._serial_last_error: Optional[str] = None
+        self._serial_connected_since_monotonic = 0.0
         self._ring_buffer = RingBuffer(
             buffer_size=buffer_size,
             max_frames=max_frames,
@@ -174,6 +259,8 @@ class SerialAdapter:
         self._control_lock = threading.Lock()
         self._queue_lock = threading.Lock()
         self._status_lock = threading.Lock()
+
+        self._load_diag_state()
 
         self._reader_stop = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
@@ -208,6 +295,290 @@ class SerialAdapter:
             command_handler=self._handle_control_command,
         )
 
+    def _resolve_diag_persist_path(self) -> Path:
+        openclaw_home = os.environ.get("OPENCLAW_HOME", "").strip()
+        if not openclaw_home:
+            openclaw_home = os.path.join(str(Path.home()), ".openclaw")
+        safe_port = re.sub(r"[^A-Za-z0-9_.-]", "_", str(self._port))
+        safe_baud = str(int(self._baudrate))
+        return (
+            Path(openclaw_home)
+            / "state"
+            / "serial-adapter"
+            / f"runtime-{safe_port}-{safe_baud}.json"
+        )
+
+    def _diag_state_json_locked(self) -> Dict[str, Any]:
+        return {
+            "version": int(DIAG_PERSIST_VERSION),
+            "updated_at_ms": int(time.time() * 1000),
+            "port": str(self._port),
+            "baudrate": int(self._baudrate),
+            "diagnosis": {
+                "code": str(self._diagnosis_code),
+                "severity": str(self._diagnosis_severity),
+                "detail": str(self._diagnosis_detail),
+                "since_ms": int(max(0.0, self._diagnosis_since_wall) * 1000),
+                "updated_ms": int(max(0.0, self._diagnosis_updated_wall) * 1000),
+                "next_step": _diagnosis_default_next_step(self._diagnosis_code),
+            },
+            "recovery": {
+                "attempts": {
+                    str(k): int(v) for k, v in self._recovery_attempts.items()
+                },
+                "cooldown_until_ms": {
+                    str(k): int(max(0.0, v) * 1000)
+                    for k, v in self._recovery_cooldown_until_wall.items()
+                },
+                "probe_suppressed_until_ms": int(
+                    max(0.0, self._idle_probe_suppressed_until_wall) * 1000
+                ),
+            },
+        }
+
+    def _persist_diag_state_locked(self) -> None:
+        try:
+            path = self._diag_persist_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                self._diag_state_json_locked(),
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            # Persistence is best-effort and must never block runtime IO.
+            return
+
+    def _load_diag_state(self) -> None:
+        path = self._diag_persist_path
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            diagnosis = payload.get("diagnosis", {})
+            recovery = payload.get("recovery", {})
+
+            code = str(diagnosis.get("code", "")).strip().lower()
+            severity = str(diagnosis.get("severity", "")).strip().lower()
+            detail = str(diagnosis.get("detail", "")).strip()
+            since_ms = diagnosis.get("since_ms")
+            updated_ms = diagnosis.get("updated_ms")
+
+            now_wall = time.time()
+            if code:
+                self._diagnosis_code = code
+            if severity:
+                self._diagnosis_severity = severity
+            if detail:
+                self._diagnosis_detail = detail
+            if isinstance(since_ms, (int, float)) and since_ms > 0:
+                self._diagnosis_since_wall = min(now_wall, float(since_ms) / 1000.0)
+            if isinstance(updated_ms, (int, float)) and updated_ms > 0:
+                self._diagnosis_updated_wall = min(now_wall, float(updated_ms) / 1000.0)
+
+            attempts = recovery.get("attempts", {})
+            if isinstance(attempts, dict):
+                self._recovery_attempts = {
+                    str(k): max(0, int(v))
+                    for k, v in attempts.items()
+                    if isinstance(v, (int, float))
+                }
+
+            cooldowns = recovery.get("cooldown_until_ms", {})
+            if isinstance(cooldowns, dict):
+                self._recovery_cooldown_until_wall = {
+                    str(k): float(v) / 1000.0
+                    for k, v in cooldowns.items()
+                    if isinstance(v, (int, float))
+                }
+
+            suppressed_ms = recovery.get("probe_suppressed_until_ms")
+            if isinstance(suppressed_ms, (int, float)) and suppressed_ms > 0:
+                self._idle_probe_suppressed_until_wall = float(suppressed_ms) / 1000.0
+        except Exception:
+            return
+
+    def _set_diagnosis_locked(
+        self,
+        code: str,
+        severity: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        normalized_code = str(code).strip().lower()
+        normalized_severity = str(severity).strip().lower()
+        normalized_detail = (
+            str(detail).strip()
+            if detail is not None
+            else _diagnosis_default_next_step(normalized_code)
+        )
+        changed = (
+            self._diagnosis_code != normalized_code
+            or self._diagnosis_severity != normalized_severity
+            or self._diagnosis_detail != normalized_detail
+        )
+        if not changed:
+            return
+
+        now_wall = time.time()
+        if self._diagnosis_code != normalized_code:
+            self._diagnosis_since_wall = now_wall
+        self._diagnosis_code = normalized_code
+        self._diagnosis_severity = normalized_severity
+        self._diagnosis_detail = normalized_detail
+        self._diagnosis_updated_wall = now_wall
+        self._persist_diag_state_locked()
+
+    def _set_diagnosis(
+        self,
+        code: str,
+        severity: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        with self._status_lock:
+            self._set_diagnosis_locked(code, severity, detail)
+
+    def _clear_recovery_action_locked(self, action: str) -> None:
+        removed = False
+        if action in self._recovery_attempts:
+            del self._recovery_attempts[action]
+            removed = True
+        if action in self._recovery_cooldown_until_wall:
+            del self._recovery_cooldown_until_wall[action]
+            removed = True
+        if removed:
+            self._persist_diag_state_locked()
+
+    def _clear_recovery_action(self, action: str) -> None:
+        with self._status_lock:
+            self._clear_recovery_action_locked(str(action))
+
+    def _reserve_recovery_attempt_locked(self, action: str) -> Dict[str, Any]:
+        normalized_action = str(action).strip()
+        if not normalized_action:
+            return {
+                "allowed": False,
+                "reason": "invalid_action",
+                "attempt": 0,
+                "max_attempts": 0,
+                "cooldown_remaining_s": 0.0,
+            }
+        now_wall = time.time()
+        max_attempts = int(RECOVERY_ACTION_MAX_ATTEMPTS.get(normalized_action, 5))
+        cooldown_s = float(RECOVERY_ACTION_COOLDOWN_S.get(normalized_action, 5.0))
+        attempt = int(self._recovery_attempts.get(normalized_action, 0))
+        cooldown_until = float(
+            self._recovery_cooldown_until_wall.get(normalized_action, 0.0)
+        )
+        if now_wall < cooldown_until:
+            return {
+                "allowed": False,
+                "reason": "cooldown",
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "cooldown_remaining_s": max(0.0, cooldown_until - now_wall),
+            }
+        if attempt >= max_attempts:
+            return {
+                "allowed": False,
+                "reason": "max_attempts_reached",
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "cooldown_remaining_s": 0.0,
+            }
+        attempt += 1
+        self._recovery_attempts[normalized_action] = attempt
+        self._recovery_cooldown_until_wall[normalized_action] = now_wall + cooldown_s
+        self._persist_diag_state_locked()
+        return {
+            "allowed": True,
+            "reason": "reserved",
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "cooldown_remaining_s": 0.0,
+        }
+
+    def _reserve_recovery_attempt(self, action: str) -> Dict[str, Any]:
+        with self._status_lock:
+            return self._reserve_recovery_attempt_locked(action)
+
+    def _evaluate_runtime_diagnosis(self) -> None:
+        now_mono = time.monotonic()
+        with self._state_lock:
+            serial_paused = bool(self._serial_paused)
+            serial_error = self._serial_last_error
+            serial_connected_since = float(self._serial_connected_since_monotonic)
+        with self._serial_lock:
+            has_serial = self._serial is not None
+        with self._status_lock:
+            last_rx = float(self._last_rx_monotonic)
+            telemetry_count = int(self._telemetry_frame_count)
+            imu_count = int(self._imu_frame_count)
+            fail_streak = int(self._auto_probe_fail_streak)
+            silent_attempts = int(
+                self._recovery_attempts.get(RECOVERY_ACTION_SILENT, 0)
+            )
+
+        if serial_paused:
+            self._set_diagnosis(
+                DIAG_CODE_SERIAL_PAUSED,
+                "info",
+                "Serial is paused for COM yield/upload.",
+            )
+            return
+
+        if not has_serial:
+            if _is_busy_error_text(serial_error):
+                self._set_diagnosis(
+                    DIAG_CODE_SERIAL_PORT_BUSY,
+                    "error",
+                    _diagnosis_default_next_step(DIAG_CODE_SERIAL_PORT_BUSY),
+                )
+            else:
+                self._set_diagnosis(
+                    DIAG_CODE_SERIAL_DISCONNECTED,
+                    "warning",
+                    _diagnosis_default_next_step(DIAG_CODE_SERIAL_DISCONNECTED),
+                )
+            return
+
+        if last_rx > 0.0:
+            silence_s = max(0.0, float(now_mono - last_rx))
+        elif serial_connected_since > 0.0:
+            silence_s = max(0.0, float(now_mono - serial_connected_since))
+        else:
+            silence_s = None
+        if silence_s is not None and silence_s > float(SILENT_TELEMETRY_THRESHOLD_S):
+            severity = "warning"
+            if fail_streak >= int(
+                SILENT_HARDWARE_ESCALATION_ATTEMPTS
+            ) and silent_attempts >= int(SILENT_HARDWARE_ESCALATION_ATTEMPTS):
+                severity = "error"
+            self._set_diagnosis(
+                DIAG_CODE_SERIAL_SILENT,
+                severity,
+                (f"No serial telemetry for {silence_s:.1f}s while COM is connected."),
+            )
+            return
+
+        self._clear_recovery_action(RECOVERY_ACTION_SILENT)
+        if telemetry_count >= int(IMU_MISSING_DIAG_MIN_FRAMES) and imu_count <= 0:
+            self._set_diagnosis(
+                DIAG_CODE_TELEMETRY_NO_IMU,
+                "warning",
+                _diagnosis_default_next_step(DIAG_CODE_TELEMETRY_NO_IMU),
+            )
+            return
+
+        self._set_diagnosis(
+            DIAG_CODE_OK,
+            "info",
+            _diagnosis_default_next_step(DIAG_CODE_OK),
+        )
+
     def _reset_runtime_state(self) -> None:
         self._ring_buffer.clear()
         self._statistics.clear()
@@ -236,6 +607,8 @@ class SerialAdapter:
             self._next_probe_index = 0
             self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
             self._auto_probe_fail_streak = 0
+            self._telemetry_frame_count = 0
+            self._imu_frame_count = 0
         with self._queue_lock:
             self._queued_control.clear()
         with self._frame_lock:
@@ -257,6 +630,8 @@ class SerialAdapter:
                 pass
             finally:
                 self._serial = None
+        with self._state_lock:
+            self._serial_connected_since_monotonic = 0.0
 
     def _open_serial_transport(self, *, raise_on_error: bool) -> bool:
         if serial is None:
@@ -270,7 +645,20 @@ class SerialAdapter:
                 self._serial = serial.Serial(self._port, self._baudrate, timeout=0)
             except Exception as exc:
                 self._serial = None
-                self._set_serial_error(f"{type(exc).__name__}: {exc}")
+                error_text = f"{type(exc).__name__}: {exc}"
+                self._set_serial_error(error_text)
+                if _is_busy_error_text(error_text):
+                    self._set_diagnosis(
+                        DIAG_CODE_SERIAL_PORT_BUSY,
+                        "error",
+                        _diagnosis_default_next_step(DIAG_CODE_SERIAL_PORT_BUSY),
+                    )
+                else:
+                    self._set_diagnosis(
+                        DIAG_CODE_SERIAL_DISCONNECTED,
+                        "warning",
+                        _diagnosis_default_next_step(DIAG_CODE_SERIAL_DISCONNECTED),
+                    )
                 if raise_on_error:
                     raise RuntimeError(
                         f"Failed to open serial port: {self._port}"
@@ -278,6 +666,14 @@ class SerialAdapter:
                 return False
 
         self._set_serial_error(None)
+        with self._state_lock:
+            self._serial_connected_since_monotonic = time.monotonic()
+        self._clear_recovery_action(RECOVERY_ACTION_REOPEN)
+        self._set_diagnosis(
+            DIAG_CODE_OK,
+            "info",
+            _diagnosis_default_next_step(DIAG_CODE_OK),
+        )
         return True
 
     def pause_serial(self, hold_s: Optional[float] = None) -> None:
@@ -300,6 +696,11 @@ class SerialAdapter:
 
         self._ring_buffer.clear()
         self._close_serial_transport()
+        self._set_diagnosis(
+            DIAG_CODE_SERIAL_PAUSED,
+            "info",
+            "Serial paused for upload/maintenance.",
+        )
 
     def resume_serial(self) -> None:
         with self._state_lock:
@@ -308,6 +709,14 @@ class SerialAdapter:
             self._next_reopen_monotonic = 0.0
             self._serial_reconnect_attempts = 0
             self._serial_last_error = None
+        with self._status_lock:
+            self._idle_probe_suppressed_until_wall = 0.0
+            self._persist_diag_state_locked()
+        self._set_diagnosis(
+            DIAG_CODE_SERIAL_DISCONNECTED,
+            "warning",
+            "Serial resumed; waiting for reconnect and telemetry.",
+        )
 
     def _maybe_reopen_serial(self) -> bool:
         now = time.monotonic()
@@ -325,12 +734,17 @@ class SerialAdapter:
                 return False
             self._next_reopen_monotonic = now + self._serial_reopen_interval_s
 
+        reopen_reservation = self._reserve_recovery_attempt(RECOVERY_ACTION_REOPEN)
+        if not bool(reopen_reservation.get("allowed")):
+            return False
+
         ok = self._open_serial_transport(raise_on_error=False)
         if ok:
             with self._state_lock:
                 self._serial_reconnect_attempts = 0
                 self._serial_last_error = None
             self._ring_buffer.clear()
+            self._clear_recovery_action(RECOVERY_ACTION_SILENT)
             self._send_next_auto_probe(reason="reopen", force=True)
             return True
 
@@ -348,6 +762,11 @@ class SerialAdapter:
             self._next_reopen_monotonic = now + self._serial_reopen_interval_s
         self._ring_buffer.clear()
         self._close_serial_transport()
+        self._set_diagnosis(
+            DIAG_CODE_SERIAL_READ_ERROR,
+            "warning",
+            _diagnosis_default_next_step(DIAG_CODE_SERIAL_READ_ERROR),
+        )
 
     def _should_send_auto_probe(self, *, force: bool) -> bool:
         if force:
@@ -360,6 +779,8 @@ class SerialAdapter:
                 # holds the lane.
                 return False
         with self._status_lock:
+            if time.time() < float(self._idle_probe_suppressed_until_wall):
+                return False
             if now - self._last_probe_monotonic < AUTO_PROBE_MIN_GAP_S:
                 return False
             idle_threshold = max(
@@ -409,7 +830,46 @@ class SerialAdapter:
                 # Connect/reopen/manual probes reset backoff window.
                 self._auto_probe_fail_streak = 0
                 self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
+                self._persist_diag_state_locked()
         return True
+
+    def _send_probe_burst_for_recovery(self) -> bool:
+        reservation = self._reserve_recovery_attempt(RECOVERY_ACTION_SILENT)
+        if not bool(reservation.get("allowed")):
+            return False
+        sent_any = False
+        for line in AUTO_PROBE_SEQUENCE:
+            try:
+                self.write_raw_line(line)
+                sent_any = True
+            except Exception as exc:
+                self._handle_serial_lost(exc)
+                break
+
+        with self._status_lock:
+            now = time.monotonic()
+            self._last_probe_monotonic = now
+            self._last_probe_line = "BURST"
+            self._last_probe_reason = "silent_recovery"
+            self._probe_sent_count += len(AUTO_PROBE_SEQUENCE)
+
+            silent_attempts = int(
+                self._recovery_attempts.get(RECOVERY_ACTION_SILENT, 0)
+            )
+            if silent_attempts >= int(SILENT_HARDWARE_ESCALATION_ATTEMPTS):
+                self._idle_probe_suppressed_until_wall = time.time() + float(
+                    SILENT_PROBE_SUPPRESS_SECONDS
+                )
+                self._set_diagnosis_locked(
+                    DIAG_CODE_SERIAL_SILENT,
+                    "error",
+                    (
+                        "Telemetry stayed silent after repeated probe bursts. "
+                        "Auto-probe is temporarily suppressed "
+                        "to avoid infinite retries."
+                    ),
+                )
+        return sent_any
 
     def connect(self) -> bool:
         """Open serial transport and start reader + TCP threads."""
@@ -433,6 +893,8 @@ class SerialAdapter:
     def _start_locked(self) -> None:
         if self._reader_thread is not None and self._reader_thread.is_alive():
             return
+        if self._serial_connected_since_monotonic <= 0.0:
+            self._serial_connected_since_monotonic = time.monotonic()
 
         if self._compat_server is not None:
             self._compat_server.start()
@@ -477,6 +939,11 @@ class SerialAdapter:
         self._stop_threads()
         self._close_serial_transport()
         self._reset_runtime_state()
+        self._set_diagnosis(
+            DIAG_CODE_SERIAL_DISCONNECTED,
+            "warning",
+            _diagnosis_default_next_step(DIAG_CODE_SERIAL_DISCONNECTED),
+        )
 
     def register_callback(self, fn: Callable[[Dict[str, Any]], None]) -> None:
         if not callable(fn):
@@ -590,6 +1057,24 @@ class SerialAdapter:
                 self._pending_frames.popleft()
             self._pending_frames.append(frame)
 
+        parsed = frame.get("parsed")
+        has_imu = False
+        if isinstance(parsed, dict):
+            parsed_lower = {str(k).lower() for k in parsed.keys()}
+            accel_seen = {"ax", "ay", "az"}.issubset(parsed_lower)
+            gyro_seen = {"gx", "gy", "gz"}.issubset(parsed_lower)
+            has_imu = accel_seen or gyro_seen
+
+        with self._status_lock:
+            self._telemetry_frame_count = int(self._telemetry_frame_count) + 1
+            if has_imu:
+                self._imu_frame_count = int(self._imu_frame_count) + 1
+            self._auto_probe_fail_streak = 0
+            self._auto_probe_backoff_s = float(AUTO_PROBE_IDLE_INTERVAL_S)
+            if self._idle_probe_suppressed_until_wall > 0.0:
+                self._idle_probe_suppressed_until_wall = 0.0
+                self._persist_diag_state_locked()
+
         self._record_rx_event()
         self._statistics.update(frame)
         self._notify_callbacks(frame)
@@ -618,6 +1103,7 @@ class SerialAdapter:
                 with self._serial_lock:
                     has_serial = self._serial is not None
                 if not has_serial and not self._maybe_reopen_serial():
+                    self._evaluate_runtime_diagnosis()
                     time.sleep(self._reader_sleep_s)
                     continue
                 has_serial = True
@@ -628,15 +1114,28 @@ class SerialAdapter:
                     self._flush_queued_control(max_items=8)
                     if not chunk and not emitted:
                         self._send_next_auto_probe(reason="idle")
+                        self._evaluate_runtime_diagnosis()
+                        with self._status_lock:
+                            needs_recovery = (
+                                self._diagnosis_code == DIAG_CODE_SERIAL_SILENT
+                                and time.time()
+                                >= float(self._idle_probe_suppressed_until_wall)
+                            )
+                        if needs_recovery:
+                            self._send_probe_burst_for_recovery()
+                    else:
+                        self._evaluate_runtime_diagnosis()
                 if not chunk and not emitted:
                     time.sleep(self._reader_sleep_s)
             except RuntimeError as exc:
                 if self._reader_stop.is_set():
                     break
                 self._handle_serial_lost(exc)
+                self._evaluate_runtime_diagnosis()
                 time.sleep(self._reader_sleep_s)
             except Exception as exc:
                 self._handle_serial_lost(exc)
+                self._evaluate_runtime_diagnosis()
                 time.sleep(self._reader_sleep_s)
 
     def poll(self) -> Optional[Dict[str, Any]]:
@@ -646,10 +1145,12 @@ class SerialAdapter:
         )
         if not reader_alive:
             if not self._maybe_reopen_serial():
+                self._evaluate_runtime_diagnosis()
                 return None
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
             self._flush_queued_control(max_items=8)
+            self._evaluate_runtime_diagnosis()
 
         with self._frame_lock:
             if not self._pending_frames:
@@ -664,10 +1165,12 @@ class SerialAdapter:
         )
         if not reader_alive:
             if not self._maybe_reopen_serial():
+                self._evaluate_runtime_diagnosis()
                 return []
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
             self._flush_queued_control(max_items=8)
+            self._evaluate_runtime_diagnosis()
 
         with self._frame_lock:
             frames = list(self._pending_frames)
@@ -1231,6 +1734,7 @@ class SerialAdapter:
 
     def get_status(self) -> Dict[str, Any]:
         now = time.monotonic()
+        now_wall = time.time()
         with self._status_lock:
             self._prune_timestamps_locked(self._rx_timestamps, now)
             self._prune_timestamps_locked(self._tx_timestamps, now)
@@ -1247,6 +1751,22 @@ class SerialAdapter:
             probe_sent_count = int(self._probe_sent_count)
             auto_probe_backoff_s = float(self._auto_probe_backoff_s)
             auto_probe_fail_streak = int(self._auto_probe_fail_streak)
+            telemetry_frame_count = int(self._telemetry_frame_count)
+            imu_frame_count = int(self._imu_frame_count)
+            diagnosis_code = str(self._diagnosis_code)
+            diagnosis_severity = str(self._diagnosis_severity)
+            diagnosis_detail = str(self._diagnosis_detail)
+            diagnosis_since_wall = float(self._diagnosis_since_wall)
+            diagnosis_updated_wall = float(self._diagnosis_updated_wall)
+            idle_probe_suppressed_until_wall = float(
+                self._idle_probe_suppressed_until_wall
+            )
+            recovery_attempts = {
+                str(k): int(v) for k, v in self._recovery_attempts.items()
+            }
+            recovery_cooldowns = {
+                str(k): float(v) for k, v in self._recovery_cooldown_until_wall.items()
+            }
         with self._control_lock:
             self._expire_control_lease_locked(now)
             lease_owner = self._control_lease_owner
@@ -1284,6 +1804,29 @@ class SerialAdapter:
             probe_last_sent_s_ago = max(0.0, now - last_probe_monotonic)
         else:
             probe_last_sent_s_ago = None
+        diagnosis_since_s_ago = max(0.0, now_wall - diagnosis_since_wall)
+        diagnosis_updated_s_ago = max(0.0, now_wall - diagnosis_updated_wall)
+        auto_repair_actions: Dict[str, Any] = {}
+        all_actions = set(recovery_attempts.keys()) | set(
+            RECOVERY_ACTION_MAX_ATTEMPTS.keys()
+        )
+        for action in sorted(all_actions):
+            attempts = int(recovery_attempts.get(action, 0))
+            cooldown_until = float(recovery_cooldowns.get(action, 0.0))
+            auto_repair_actions[action] = {
+                "attempts": attempts,
+                "max_attempts": int(RECOVERY_ACTION_MAX_ATTEMPTS.get(action, 0)),
+                "cooldown_remaining_s": (
+                    max(0.0, cooldown_until - now_wall)
+                    if cooldown_until > now_wall
+                    else 0.0
+                ),
+            }
+        probe_suppressed_remaining_s = (
+            max(0.0, idle_probe_suppressed_until_wall - now_wall)
+            if idle_probe_suppressed_until_wall > now_wall
+            else 0.0
+        )
 
         if self._compat_server is not None:
             connected_clients = self._compat_server.get_client_count()
@@ -1312,6 +1855,8 @@ class SerialAdapter:
             "serial_port": self._port,
             "serial_baudrate": int(self._baudrate),
             "telemetry_last_rx_s_ago": telemetry_last_rx_s_ago,
+            "telemetry_frame_count": telemetry_frame_count,
+            "imu_frame_count": imu_frame_count,
             "auto_probe": {
                 "enabled": True,
                 "sequence": list(AUTO_PROBE_SEQUENCE),
@@ -1321,12 +1866,25 @@ class SerialAdapter:
                 "last_sent_s_ago": probe_last_sent_s_ago,
                 "backoff_s": auto_probe_backoff_s,
                 "fail_streak": auto_probe_fail_streak,
+                "suppressed_remaining_s": probe_suppressed_remaining_s,
             },
             "control_lease": {
                 "owner": lease_owner,
                 "priority": lease_priority,
                 "remaining_s": lease_remaining_s,
                 "active": lease_owner is not None,
+            },
+            "diagnosis": {
+                "code": diagnosis_code,
+                "severity": diagnosis_severity,
+                "detail": diagnosis_detail,
+                "since_s_ago": diagnosis_since_s_ago,
+                "updated_s_ago": diagnosis_updated_s_ago,
+                "next_step": _diagnosis_default_next_step(diagnosis_code),
+                "auto_repair": {
+                    "actions": auto_repair_actions,
+                    "probe_suppressed_remaining_s": probe_suppressed_remaining_s,
+                },
             },
             "degraded": (not serial_connected) or serial_paused,
         }
@@ -1379,6 +1937,19 @@ class SerialAdapter:
                     "purpose": (
                         "wake telemetry streaming firmware and reduce manual retries"
                     ),
+                },
+                "diagnosis": {
+                    "codes": [
+                        DIAG_CODE_OK,
+                        DIAG_CODE_SERIAL_PAUSED,
+                        DIAG_CODE_SERIAL_DISCONNECTED,
+                        DIAG_CODE_SERIAL_PORT_BUSY,
+                        DIAG_CODE_SERIAL_READ_ERROR,
+                        DIAG_CODE_SERIAL_SILENT,
+                        DIAG_CODE_TELEMETRY_NO_IMU,
+                    ],
+                    "auto_repair_actions": sorted(RECOVERY_ACTION_MAX_ATTEMPTS.keys()),
+                    "state_persisted": True,
                 },
             },
             "control": {

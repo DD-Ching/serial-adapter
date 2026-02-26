@@ -1727,6 +1727,27 @@ const plugin = {
           runtimeStatus?.telemetry_last_rx_s_ago
         );
         const runtimeAutoProbe = asRecord(runtimeStatus?.auto_probe);
+        const runtimeDiagnosis = asRecord(runtimeStatus?.diagnosis);
+        const runtimeDiagnosisCode =
+          runtimeDiagnosis && typeof runtimeDiagnosis.code === "string"
+            ? runtimeDiagnosis.code
+            : null;
+        const runtimeDiagnosisSeverity =
+          runtimeDiagnosis && typeof runtimeDiagnosis.severity === "string"
+            ? runtimeDiagnosis.severity
+            : null;
+        const runtimeDiagnosisDetail =
+          runtimeDiagnosis && typeof runtimeDiagnosis.detail === "string"
+            ? runtimeDiagnosis.detail
+            : null;
+        const runtimeDiagnosisNextStep =
+          runtimeDiagnosis && typeof runtimeDiagnosis.next_step === "string"
+            ? runtimeDiagnosis.next_step
+            : null;
+        const runtimeAutoRepair = asRecord(runtimeDiagnosis?.auto_repair);
+        const runtimeProbeSuppressedRemaining = asFiniteNumber(
+          runtimeAutoRepair?.probe_suppressed_remaining_s
+        );
         const runtimeLastAutoProbeSAgo = asFiniteNumber(
           runtimeAutoProbe?.last_sent_s_ago
         );
@@ -1739,6 +1760,11 @@ const plugin = {
         if (probeRequested) {
           if (telemetryLastRxSAgo !== null && telemetryLastRxSAgo <= 1.2) {
             probeReason = "skipped_recent_telemetry";
+          } else if (
+            runtimeProbeSuppressedRemaining !== null &&
+            runtimeProbeSuppressedRemaining > 0
+          ) {
+            probeReason = "runtime_probe_suppressed";
           } else if (
             runtimeLastAutoProbeSAgo !== null &&
             runtimeLastAutoProbeSAgo <= 0.9
@@ -1772,6 +1798,32 @@ const plugin = {
         }
 
         const observed = await observeTelemetryWindow(observeMs, maxFrames);
+        const summary: Record<string, unknown> = {
+          ...(observed.summary ?? {}),
+        };
+        const observedDiagnosis =
+          typeof summary.diagnosis === "string" ? summary.diagnosis : null;
+        const shouldApplyRuntimeDiagnosis =
+          runtimeDiagnosisCode !== null &&
+          runtimeDiagnosisCode !== "ok" &&
+          (observed.frames.length === 0 ||
+            observedDiagnosis === null ||
+            observedDiagnosis === "no_telemetry_frames");
+        if (shouldApplyRuntimeDiagnosis) {
+          summary.diagnosis = runtimeDiagnosisCode;
+          if (runtimeDiagnosisNextStep) {
+            summary.next_step = runtimeDiagnosisNextStep;
+          }
+        }
+        if (runtimeDiagnosisCode !== null) {
+          summary.runtime_diagnosis = {
+            code: runtimeDiagnosisCode,
+            severity: runtimeDiagnosisSeverity,
+            detail: runtimeDiagnosisDetail,
+            next_step: runtimeDiagnosisNextStep,
+            probe_suppressed_remaining_s: runtimeProbeSuppressedRemaining,
+          };
+        }
         const includeFrames = params.includeFrames === true;
 
         return jsonResult({
@@ -1779,7 +1831,7 @@ const plugin = {
           port: bridge.serial_port,
           observe_ms: observeMs,
           sampled_frames: observed.frames.length,
-          summary: observed.summary,
+          summary,
           probe: {
             requested: probeRequested,
             performed: probePerformed,

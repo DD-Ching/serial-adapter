@@ -167,6 +167,15 @@ if ($controlListen.listening) {
     if ($runtime.auto_probe.fail_streak -ge 8) {
       $warnings.Add("auto-probe fail streak high ($($runtime.auto_probe.fail_streak)); check firmware protocol")
     }
+    if ($runtime.diagnosis -and $runtime.diagnosis.code -and $runtime.diagnosis.code -ne "ok") {
+      $diag = [string]$runtime.diagnosis.code
+      $next = [string]$runtime.diagnosis.next_step
+      if ([string]::IsNullOrWhiteSpace($next)) {
+        $warnings.Add("runtime diagnosis: $diag")
+      } else {
+        $warnings.Add("runtime diagnosis: $diag; next: $next")
+      }
+    }
   }
 }
 
