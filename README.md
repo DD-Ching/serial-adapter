@@ -91,6 +91,18 @@ python scripts/hardware_e2e_check.py --host 127.0.0.1 --control-port 9001 --tele
 powershell -ExecutionPolicy Bypass -File scripts/semantic_e2e_check.ps1
 ```
 
+4c. One-command self-verify gate (install/runtime + semantic + hardware + sticky session + compliance):
+
+```powershell
+npm run self-verify
+```
+
+The command prints one JSON report with:
+- `publish_ready`: true means packaging/install/compliance gates are green.
+- `merge_main_ready`: true means publish gate + semantic gate + hardware gate are all green.
+- `dynamic_session_path.session_sticky`: confirms repeated semantic calls reused the same bridge session.
+- `hardware_path.diagnosis`: exact reason when IMU/telemetry is not flowing.
+
 5. Send low-rate control command and read machine-readable ACK:
 
 ```bash
@@ -113,6 +125,7 @@ node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
 Before opening any PR, run and review:
 
 - `docs/release/PRE_PR_CHECKLIST.md`
+- `docs/release/OFFICIAL_GUIDELINES_MAP.md`
 
 Rule: if checklist is not fully green, stop and fix first.
 
