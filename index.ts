@@ -791,6 +791,32 @@ function flushTelemetryBacklog(maxFrames = 400): number {
   return telemetryClient.pollFrames(safeMax).length;
 }
 
+interface ObservedTelemetryWindow {
+  frames: TelemetryFrame[];
+  summary: Record<string, unknown>;
+}
+
+async function observeTelemetryWindow(
+  durationMs: number,
+  maxFrames = DEFAULT_OBSERVE_MAX_FRAMES
+): Promise<ObservedTelemetryWindow> {
+  const frames = await collectTelemetryFrames(durationMs, maxFrames);
+  return {
+    frames,
+    summary: summarizeTelemetryFrames(
+      frames,
+      telemetryClient?.bufferedCount() ?? 0
+    ),
+  };
+}
+
+function optionalFrames(
+  frames: TelemetryFrame[],
+  includeFrames?: boolean
+): TelemetryFrame[] | undefined {
+  return includeFrames === true ? frames : undefined;
+}
+
 function pwmToApproxAngle(pwm: number): number {
   const normalized = clamp(Math.round(((pwm - 500) / 2000) * 180), 0, 180);
   return normalized;
@@ -1025,14 +1051,13 @@ async function executeSemanticIntent(options: {
   }
 
   if (intent === "status") {
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
+    const observed = await observeTelemetryWindow(verifyMs);
     return {
       status: "ok",
       intent,
       action: "observe_only",
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
@@ -1044,17 +1069,20 @@ async function executeSemanticIntent(options: {
       intervalMs: 120,
       source: options.source,
     });
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-    const verification = evaluateStopVerification(frames, STOP_TARGET_DEFAULT, "stop");
+    const observed = await observeTelemetryWindow(verifyMs);
+    const verification = evaluateStopVerification(
+      observed.frames,
+      STOP_TARGET_DEFAULT,
+      "stop"
+    );
     return {
       status: "ok",
       intent,
       action: "best_effort_stop",
       target_angle: STOP_TARGET_DEFAULT,
       verification,
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
@@ -1062,17 +1090,16 @@ async function executeSemanticIntent(options: {
     const target = parseAbsoluteAngle(text, options.targetAngle) ?? STOP_TARGET_DEFAULT;
     flushTelemetryBacklog();
     await sendServoAngleBestEffort(target, options.source);
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-    const verification = evaluateStopVerification(frames, target);
+    const observed = await observeTelemetryWindow(verifyMs);
+    const verification = evaluateStopVerification(observed.frames, target);
     return {
       status: "ok",
       intent,
       action: "set_center",
       target_angle: target,
       verification,
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
@@ -1087,9 +1114,8 @@ async function executeSemanticIntent(options: {
 
     flushTelemetryBacklog();
     await sendServoAngleBestEffort(target, options.source);
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-    const verification = evaluateStopVerification(frames, target);
+    const observed = await observeTelemetryWindow(verifyMs);
+    const verification = evaluateStopVerification(observed.frames, target);
     return {
       status: "ok",
       intent,
@@ -1099,8 +1125,8 @@ async function executeSemanticIntent(options: {
       delta: Math.abs(target - current),
       intensity,
       verification,
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
@@ -1111,17 +1137,16 @@ async function executeSemanticIntent(options: {
     await sendServoAngleBestEffort(angle, options.source);
     await sleep(180);
   }
-  const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-  const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-  const verification = evaluateStopVerification(frames, 90);
+  const observed = await observeTelemetryWindow(verifyMs);
+  const verification = evaluateStopVerification(observed.frames, 90);
   return {
     status: "ok",
     intent,
     action: intent === "nod" ? "motion_nod" : "motion_shake",
     sequence,
     verification,
-    summary,
-    frames: includeFrames ? frames : undefined,
+    summary: observed.summary,
+    frames: optionalFrames(observed.frames, includeFrames),
   };
 }
 
@@ -1746,16 +1771,15 @@ const plugin = {
           }
         }
 
-        const frames = await collectTelemetryFrames(observeMs, maxFrames);
-        const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
+        const observed = await observeTelemetryWindow(observeMs, maxFrames);
         const includeFrames = params.includeFrames === true;
 
         return jsonResult({
           status: "connected",
           port: bridge.serial_port,
           observe_ms: observeMs,
-          sampled_frames: frames.length,
-          summary,
+          sampled_frames: observed.frames.length,
+          summary: observed.summary,
           probe: {
             requested: probeRequested,
             performed: probePerformed,
@@ -1772,7 +1796,7 @@ const plugin = {
             runtime_status: bridge.runtime_status,
             session: bridge.bridge_session,
           },
-          frames: includeFrames ? frames : undefined,
+          frames: optionalFrames(observed.frames, includeFrames),
         });
       },
     });
@@ -1987,9 +2011,12 @@ const plugin = {
           });
         }
 
-        const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-        const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
-        const verification = evaluateStopVerification(frames, targetAngle, "stop");
+        const observed = await observeTelemetryWindow(verifyMs);
+        const verification = evaluateStopVerification(
+          observed.frames,
+          targetAngle,
+          "stop"
+        );
 
         return jsonResult({
           status: "stop_sequence_sent",
@@ -2005,8 +2032,8 @@ const plugin = {
             session: bridge.bridge_session,
           },
           verification,
-          summary,
-          frames: includeFrames ? frames : undefined,
+          summary: observed.summary,
+          frames: optionalFrames(observed.frames, includeFrames),
           next_step:
             verification.verified === true
               ? "Stop verified from telemetry."
@@ -2119,12 +2146,14 @@ const plugin = {
             intervalMs,
             source,
           });
-          const frames = await collectTelemetryFrames(
-            Math.max(400, Math.min(2000, intervalMs * repeats + 600)),
-            DEFAULT_OBSERVE_MAX_FRAMES
+          const observed = await observeTelemetryWindow(
+            Math.max(400, Math.min(2000, intervalMs * repeats + 600))
           );
-          const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
-          const verification = evaluateStopVerification(frames, targetAngle, "stop");
+          const verification = evaluateStopVerification(
+            observed.frames,
+            targetAngle,
+            "stop"
+          );
           return jsonResult({
             status: "sent",
             template,
@@ -2137,14 +2166,14 @@ const plugin = {
               auto_connected: bridge.auto_connected,
               resumed: bridge.resumed,
               serial_port: bridge.serial_port,
-              session: bridge.bridge_session,
-            },
-            verification,
-            summary,
-            note:
-              verification.verified === true
-                ? "center_stop verified from telemetry."
-                : "center_stop command sent but not verified from telemetry.",
+            session: bridge.bridge_session,
+          },
+          verification,
+          summary: observed.summary,
+          note:
+            verification.verified === true
+              ? "center_stop verified from telemetry."
+              : "center_stop command sent but not verified from telemetry.",
           });
         }
 
