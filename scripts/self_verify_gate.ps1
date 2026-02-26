@@ -56,6 +56,10 @@ function Normalize-RepoUrl {
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+$preflight = Invoke-JsonCommand -Command {
+  powershell -ExecutionPolicy Bypass -File "$PSScriptRoot\preflight_runtime_guard.ps1" -OpenClaw $OpenClaw
+}
+
 $quick = Invoke-JsonCommand -Command {
   npm run quick-check -- --json
 }
@@ -131,6 +135,11 @@ $report = [ordered]@{
   timestamp = (Get-Date).ToString("o")
   branch = (& git rev-parse --abbrev-ref HEAD | Out-String).Trim()
   commit = (& git rev-parse --short HEAD | Out-String).Trim()
+  preflight = [ordered]@{
+    pass = [bool]$preflight.pass
+    blocking = @($preflight.blocking)
+    warnings = @($preflight.warnings)
+  }
   install_and_runtime = [ordered]@{
     quick_check_ok = [bool]$quick.ok
     telemetry_port_listening = [bool]$quick.ports.telemetry.listening
@@ -178,6 +187,7 @@ $report = [ordered]@{
 }
 
 $publishReady = (
+  $report.preflight.pass -and
   $report.install_and_runtime.quick_check_ok -and
   $report.install_and_runtime.control_port_listening -and
   $report.install_and_runtime.telemetry_port_listening -and

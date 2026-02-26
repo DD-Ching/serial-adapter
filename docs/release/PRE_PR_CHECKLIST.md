@@ -35,6 +35,7 @@ Before opening any PR, run this checklist and review results together.
 ```powershell
 # in repo root
 powershell -ExecutionPolicy Bypass -File scripts/quick_check.ps1 -Json
+powershell -ExecutionPolicy Bypass -File scripts/preflight_runtime_guard.ps1
 powershell -ExecutionPolicy Bypass -File scripts/self_verify_gate.ps1
 python -m pytest tests/test_tcp_server.py tests/test_adapter.py
 ```

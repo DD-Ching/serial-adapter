@@ -12,11 +12,13 @@ Run this skill before any npm publish or merge to `main`.
 From plugin repo root, run:
 
 ```powershell
+npm run preflight-runtime
 npm run self-verify
 ```
 
 Parse the JSON result and decide from these fields:
 
+- `preflight.pass`: runtime/auth/config/toolchain gate.
 - `publish_ready`: true means packaging/install/compliance gates are green.
 - `merge_main_ready`: true means publish gate + semantic gate + hardware gate are green.
 - `dynamic_session_path.session_sticky`: true means repeated semantic calls reuse the same bridge session.

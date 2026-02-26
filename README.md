@@ -97,6 +97,12 @@ powershell -ExecutionPolicy Bypass -File scripts/semantic_e2e_check.ps1
 npm run self-verify
 ```
 
+Runtime-only preflight (faster, before semantic/hardware checks):
+
+```powershell
+npm run preflight-runtime
+```
+
 The command prints one JSON report with:
 - `publish_ready`: true means packaging/install/compliance gates are green.
 - `merge_main_ready`: true means publish gate + semantic gate + hardware gate are all green.
@@ -126,6 +132,7 @@ Before opening any PR, run and review:
 
 - `docs/release/PRE_PR_CHECKLIST.md`
 - `docs/release/OFFICIAL_GUIDELINES_MAP.md`
+- `docs/release/LONG_TERM_OPTIMIZATION_ROADMAP.md`
 
 Rule: if checklist is not fully green, stop and fix first.
 
